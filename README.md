@@ -122,6 +122,51 @@ If more sales are made on the viewing laptop after you clear the pause, it pause
   - the copies in OneDrive
   - `sqlite3.exe` and the BurntToast module, so a reinstall works offline. Add `-Purge` to remove these two as well.
 - **Rehearse a takeover once** before you rely on it. See `VERIFY.md` for the checks that can only be done on the real laptops.
+- **Updates install themselves.** Every day at 03:00, or as soon as the laptop is on after that, and 10 minutes after sign-in, the laptop checks for a new release.
+  - When there is one, you'll see "Sync tool updated to v1.2.0".
+  - To stop automatic updates, set `"autoUpdate": false` in `config.json`.
+
+## Releasing an update
+
+Clients only ever install **published GitHub releases**. Pushing to `master` changes nothing on the laptops.
+
+1. Make the change, run the tests, commit and push to `master`.
+2. Bump `VERSION`, for example `v1.0.0` to `v1.1.0`, using `vMAJOR.MINOR.PATCH`. Commit and push it.
+3. Build and check the package without publishing:
+   ```
+   powershell -ExecutionPolicy Bypass -File tools\make-release.ps1 -NoUpload
+   ```
+   - It needs a clean tree on `master` and a tag that doesn't exist yet.
+   - It zips the tracked top-level runtime files into `dist\ar-sync-<tag>.zip` and writes `dist\ar-sync-<tag>.zip.sha256`.
+   - It refuses anything matching `*.db`, `fixtures/`, `config.json` or `*.log`.
+   - It unpacks the zip and runs the same checks a laptop runs.
+4. Publish:
+   ```
+   powershell -ExecutionPolicy Bypass -File tools\make-release.ps1
+   ```
+   This tags the commit, pushes the tag, and runs `gh release create` with both files. It needs the [GitHub CLI](https://cli.github.com/), signed in with `gh auth login`.
+
+**What each laptop then does** (`update.ps1`, daily and after sign-in):
+1. It asks `api.github.com` for the latest published release and compares the tag with its own `VERSION`. It only moves forward on its own.
+2. It downloads `ar-sync-<tag>.zip` and `.sha256` over HTTPS from GitHub hosts only, and stops if either is missing or the hash doesn't match.
+3. It unpacks to a temp folder and checks the package:
+   - the required files are there
+   - `VERSION` matches the tag
+   - every script parses
+   - the module imports in a separate PowerShell
+4. It waits for any running sync step, using the same lock as publish and check, so it never updates mid-sync.
+5. It copies the package files over the install. It saves each replaced file in `update-backup\` first.
+   - `config.json`, `state\`, `backups\`, `bin\`, `sync.log` and `SYNC-PAUSED.txt` are never in a package and never touched.
+6. It re-registers the scheduled tasks and the toast link only if their definitions changed.
+7. Any failure after the copy puts the old files back. Success and failure are both logged and shown as a notification.
+
+**To roll back or pin a laptop**, run:
+```
+powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\AroniumSync\update.ps1" -Version v1.0.0
+```
+This installs that exact release and pins it, so scheduled runs leave it alone. `update.ps1 -Unpin` follows new releases again.
+
+To withdraw a bad release, publish a fixed, higher version. Deleting a release doesn't move laptops back.
 
 ## For developers
 
@@ -131,4 +176,5 @@ If more sales are made on the viewing laptop after you clear the pause, it pause
 - If `fixtures\real.db` exists, every database test also runs on a copy of it. It's gitignored: put a copy of a real backup there yourself and never commit it.
 - Layout:
   - All logic is in `AroniumSync.psm1`.
-  - `publish.ps1`, `check.ps1`, `takeover.ps1`, `update-now.ps1`, `protocol-handler.ps1`, `clear-pause.ps1` and `set-role.ps1` are thin wrappers.
+  - `publish.ps1`, `check.ps1`, `takeover.ps1`, `update-now.ps1`, `protocol-handler.ps1`, `clear-pause.ps1`, `set-role.ps1` and `update.ps1` are thin wrappers.
+  - `tools\make-release.ps1` builds and publishes releases. It isn't shipped to laptops.
