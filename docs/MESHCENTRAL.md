@@ -46,18 +46,18 @@ To remove it later, run the same `.exe` and click **Uninstall**. Or use
 Once a laptop shows up, run section 3 on it right away through Terminal.
 
 **Staff web page.** The same guide, with an "Install link" button, is at
-https://silongstrategies.com/staff/, behind nginx basic auth. It lives only on the
-server, in `/var/www/staff/index.html`, which is not in any git repo, so the invite
-link never lands in git.
+https://mesh.silongstrategies.com/staff/, behind nginx basic auth. It's TLS all the
+way to the droplet. The old URL, silongstrategies.com/staff/, redirects here. It
+lives only on the server, in `/var/www/staff/index.html`, which is not in any git
+repo, so the invite link never lands in git. The nginx block is in
+`/etc/nginx/sites-available/meshcentral`, before the MeshCentral proxy.
 
 - Set or change the staff login: `ssh silong` then
   `sudo htpasswd -c /etc/nginx/.htpasswd-staff staff`. With no login set, the page
   refuses everyone.
 - Paste the invite link: `sudo nano /var/www/staff/index.html`, then replace
   `PASTE-INVITE-LINK-HERE` (and `<HELP-CONTACT>`).
-- The main domain goes through the Namecheap proxy to the droplet on plain :80. So the
-  staff password travels unencrypted on that last hop. Use a password just for this
-  page.
+- Staff open it in any browser and enter that username and password when asked.
 
 ## 3. Stop the laptops sleeping on AC power
 
