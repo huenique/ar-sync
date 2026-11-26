@@ -88,6 +88,10 @@ laptop then clicks Allow before a session starts.
   scan the QR with an authenticator app → enter the code. Then save the
   **backup codes** somewhere safe (**Manage backup codes**).
 - Idle web sessions log out after 30 minutes.
+- Don't use `newAccountsPass` (the sign-up password) in 1.3.2. It always rejects
+  the right password: the login page sends the field as `anewaccountpass`, but
+  `webserver.js` (line 1782) reads `newaccountspass`. To let someone sign up, keep
+  `newAccounts: false` and create their account from **My Users** instead.
 
 ## 6. Update MeshCentral
 
