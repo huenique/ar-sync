@@ -577,3 +577,15 @@ Describe 'Fingerprint' -ForEach $Cases {
         $before | Should -Not -Match 'missing'
     }
 }
+
+Describe 'sqlite3 stdin encoding' {
+    It 'works when the console input encoding is UTF-8 with a BOM (code page 65001)' {
+        $L = New-TwoLaptops -Kind 'synthetic'
+        $old = [Console]::InputEncoding
+        try {
+            [Console]::InputEncoding = New-Object System.Text.UTF8Encoding $true
+            $r = InModuleScope AroniumSync -Parameters @{ C = $L.A } { param($C) Invoke-Sqlite -Config $C -Database $C.dbPath -Sql 'SELECT 41+1;' -ReadOnly }
+            $r | Should -Be '42'
+        } finally { [Console]::InputEncoding = $old }
+    }
+}

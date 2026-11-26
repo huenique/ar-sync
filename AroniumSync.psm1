@@ -205,7 +205,13 @@ function Invoke-Sqlite {
     $psi.RedirectStandardError = $true
     $psi.StandardOutputEncoding = $script:Utf8NoBom
     $psi.StandardErrorEncoding = $script:Utf8NoBom
-    $p = [System.Diagnostics.Process]::Start($psi)
+    # .NET Framework opens stdin with Console.InputEncoding; when that is UTF-8 (code page 65001,
+    # e.g. launched from pwsh or with Windows' "Beta: UTF-8" setting) it writes a BOM first and
+    # sqlite3 rejects the script. Force BOM-less UTF-8 for the duration of the start.
+    $oldIn = $null
+    try { $oldIn = [Console]::InputEncoding; [Console]::InputEncoding = $script:Utf8NoBom } catch { $oldIn = $null }
+    try { $p = [System.Diagnostics.Process]::Start($psi) }
+    finally { if ($oldIn) { try { [Console]::InputEncoding = $oldIn } catch { } } }
     $outTask = $p.StandardOutput.ReadToEndAsync()
     $errTask = $p.StandardError.ReadToEndAsync()
     $bytes = $script:Utf8NoBom.GetBytes(".timeout 5000`n" + $Sql + "`n")
