@@ -8,5 +8,6 @@
   "staleMinutes": 60,
   "ownerContact": "the owner",
   "historyDays": 30,
-  "keepBackups": 10
+  "keepBackups": 10,
+  "autoUpdate": true
 }

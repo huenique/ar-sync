@@ -5,7 +5,10 @@ fixtures/
 *.db-wal
 *.bak
 # Downloaded binaries
-tools/
+tools/*
+!tools/make-release.ps1
+# Release builds
+dist/
 # Per-machine files
 config.json
 sync.log

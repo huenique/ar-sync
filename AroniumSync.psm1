@@ -35,7 +35,8 @@ function Get-SyncConfig {
         ownerContact       = 'the owner'
         historyDays        = 30
         keepBackups        = 10
-        baseDir            = '%LOCALAPPDATA%\AroniumSync'
+        autoUpdate         = $true
+        baseDir           = '%LOCALAPPDATA%\AroniumSync'
         mutexName          = 'Local\AroniumSync'
     }
     foreach ($k in $defaults.Keys) { if (-not $cfg.ContainsKey($k) -or $null -eq $cfg[$k]) { $cfg[$k] = $defaults[$k] } }
@@ -131,7 +132,7 @@ function Get-SyncState {
     $h = @{}
     if ($o) { foreach ($p in $o.PSObject.Properties) { $h[$p.Name] = $p.Value } }
     foreach ($k in @('notifiedSha', 'notifiedAt', 'laterSha', 'staleToastFor', 'pausedFingerprint', 'ackFingerprint', 'pausedToastAt', 'notWriterToastAt',
-            'lastPublishedAt', 'supersededPublishedAt')) {
+            'lastPublishedAt', 'supersededPublishedAt', 'updatePin')) {
         if (-not $h.ContainsKey($k)) { $h[$k] = $null }
     }
     return $h
@@ -1231,6 +1232,435 @@ function Install-PinnedSqlite {
     } finally {
         Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
     }
+}
+
+# ---------------------------------------------------------------- self-update from GitHub Releases
+#
+# Clients have no git. update.ps1 asks the GitHub Releases API for the latest published release
+# (drafts and plain pushes never show up there), downloads ar-sync-<tag>.zip and its .sha256,
+# checks the hash, stages and checks the package, then copies it over the install folder.
+# Only files that are in the package are touched, so config.json, state\, backups\, bin\,
+# sync.log and SYNC-PAUSED.txt are never overwritten. Any failure after the copy rolls back.
+
+$script:UpdateRepo = 'huenique/ar-sync'
+# release-assets.githubusercontent.com is where GitHub now redirects release downloads.
+$script:UpdateHosts = @('api.github.com', 'github.com', 'objects.githubusercontent.com', 'release-assets.githubusercontent.com')
+$script:UpdateTaskName = 'AroniumSync Update'
+$script:VersionPattern = '^v\d+\.\d+\.\d+$'
+$script:ReleaseRequired = @('AroniumSync.psm1', 'update.ps1', 'publish.ps1', 'check.ps1', 'VERSION')
+
+function Test-UpdateUrl {
+    # Only HTTPS on the default port, only GitHub's own hosts.
+    param([AllowNull()][AllowEmptyString()][string]$Url)
+    $u = $null
+    if ([string]::IsNullOrEmpty($Url) -or -not [Uri]::TryCreate($Url, [UriKind]::Absolute, [ref]$u)) { return $false }
+    return ($u.Scheme -eq 'https' -and $u.IsDefaultPort -and $script:UpdateHosts -contains $u.Host.ToLowerInvariant())
+}
+
+function Invoke-UpdateHttp {
+    # GET with redirects followed by hand, so every hop is checked against Test-UpdateUrl.
+    # Returns the body as text, or writes it to OutFile.
+    param([Parameter(Mandatory)][string]$Url, [string]$OutFile)
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    $next = $Url
+    for ($hop = 0; $hop -lt 6; $hop++) {
+        if (-not (Test-UpdateUrl $next)) { throw "Refusing to download from $next (only GitHub over HTTPS)" }
+        $req = [Net.HttpWebRequest]::Create($next)
+        $req.AllowAutoRedirect = $false
+        $req.UserAgent = 'ar-sync-updater'
+        $req.Accept = $(if ($OutFile) { 'application/octet-stream' } else { 'application/vnd.github+json' })
+        $req.Timeout = 60000
+        $resp = $null
+        try { $resp = $req.GetResponse() } catch {
+            $e = $_.Exception
+            while ($e.InnerException -and -not ($e -is [Net.WebException])) { $e = $e.InnerException }
+            if ($e -is [Net.WebException] -and $e.Response) { $resp = $e.Response } else { throw }
+        }
+        $code = [int]$resp.StatusCode
+        if ($code -ge 300 -and $code -lt 400) {
+            $loc = $resp.Headers['Location']
+            $resp.Close()
+            if (-not $loc) { throw "Redirect without a Location from $next" }
+            $next = ([Uri]::new([Uri]$next, $loc)).AbsoluteUri
+            continue
+        }
+        try {
+            if ($code -ne 200) { throw "HTTP $code from $next" }
+            $stream = $resp.GetResponseStream()
+            if ($OutFile) {
+                $fs = [IO.File]::Create($OutFile)
+                try { $stream.CopyTo($fs) } finally { $fs.Dispose() }
+                return
+            }
+            $reader = New-Object IO.StreamReader($stream, [Text.Encoding]::UTF8)
+            return $reader.ReadToEnd()
+        } finally { $resp.Close() }
+    }
+    throw "Too many redirects from $Url"
+}
+
+function Invoke-UpdateApi {
+    param([Parameter(Mandatory)][string]$Url)
+    return ((Invoke-UpdateHttp -Url $Url) | ConvertFrom-Json)
+}
+
+function Invoke-UpdateDownload {
+    param([Parameter(Mandatory)][string]$Url, [Parameter(Mandatory)][string]$OutFile)
+    Invoke-UpdateHttp -Url $Url -OutFile $OutFile
+}
+
+function Get-UpdateRelease {
+    # The latest published release, or the one with this tag.
+    param([string]$Version)
+    $base = 'https://api.github.com/repos/' + $script:UpdateRepo + '/releases/'
+    if ($Version) { return (Invoke-UpdateApi -Url ($base + 'tags/' + $Version)) }
+    return (Invoke-UpdateApi -Url ($base + 'latest'))
+}
+
+function ConvertTo-SyncVersion {
+    param([Parameter(Mandatory)][string]$Tag)
+    if ($Tag -notmatch $script:VersionPattern) { throw "'$Tag' is not a version like v1.2.3" }
+    return [version]$Tag.Substring(1)
+}
+
+function Get-InstalledVersion {
+    # Installs from before the updater have no VERSION file: treat them as v0.0.0.
+    param([Parameter(Mandatory)][string]$AppDir)
+    $p = Join-Path $AppDir 'VERSION'
+    if (-not (Test-Path -LiteralPath $p)) { return 'v0.0.0' }
+    $v = ([IO.File]::ReadAllText($p)).Trim()
+    if ($v -notmatch $script:VersionPattern) { return 'v0.0.0' }
+    return $v
+}
+
+function Assert-ReleaseFiles {
+    # Throws if a package (or a release being built) would carry shop data or per-laptop files.
+    param([Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Paths)
+    $bad = @()
+    foreach ($p in $Paths) {
+        $n = $p.Replace('\', '/').TrimStart('./')
+        $leaf = ($n -split '/')[-1]
+        $top = ($n -split '/')[0]
+        if ($leaf -like '*.db' -or $leaf -like '*.db-*' -or $leaf -like '*.bak' -or $leaf -like '*.log' -or $leaf -eq 'config.json' -or
+            $leaf -eq 'SYNC-PAUSED.txt' -or @('fixtures', 'state', 'backups', 'bin', 'update-backup') -contains $top) { $bad += $p }
+    }
+    if ($bad.Count -gt 0) { throw ('Refusing to package: ' + ($bad -join ', ')) }
+}
+
+function Invoke-PowerShellChild {
+    # Runs a script in a fresh Windows PowerShell, so a staged module can be loaded without
+    # touching the one this process is running. Returns @{ Code; Out }.
+    param([Parameter(Mandatory)][string]$Script)
+    $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($Script))
+    $out = & (Get-PowerShellExe) -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $enc 2>&1
+    return @{ Code = $LASTEXITCODE; Out = @($out | ForEach-Object { [string]$_ }) }
+}
+
+function ConvertTo-PsQuoted {
+    param([Parameter(Mandatory)][string]$Value)
+    return "'" + $Value.Replace("'", "''") + "'"
+}
+
+function Get-SyncDefinitionHash {
+    # Hash of what install registers (role task, update task, toast link). If an update changes
+    # it, the update re-registers them; otherwise it leaves Task Scheduler and the registry alone.
+    param([Parameter(Mandatory)][hashtable]$Config, [Parameter(Mandatory)][string]$AppDir)
+    $user = '{0}\{1}' -f $env:USERDOMAIN, $env:USERNAME
+    $fixed = [datetime]'2000-01-01'
+    $script = if ($Config.role -eq 'seller') { Join-Path $AppDir 'publish.ps1' } else { Join-Path $AppDir 'check.ps1' }
+    $s = (Get-SyncTaskXml -Role $Config.role -ScriptPath $script -UserId $user -Start $fixed) + "`n" +
+    (Get-ProtocolCommand -HandlerScript (Join-Path $AppDir 'protocol-handler.ps1')) + "`n" +
+    (Get-UpdateTaskXml -ScriptPath (Join-Path $AppDir 'update.ps1') -UserId $user -Start $fixed)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($s))) -replace '-', '').ToLowerInvariant() }
+    finally { $sha.Dispose() }
+}
+
+function Test-ModuleImport {
+    # Imports the module at Path in a child PowerShell. With ConfigPath/AppDir, also returns that
+    # module's definition hash; otherwise returns 'ok'. Throws if the module will not load.
+    param([Parameter(Mandatory)][string]$ModulePath, [string]$ConfigPath, [string]$AppDir)
+    $body = "Import-Module $(ConvertTo-PsQuoted $ModulePath) -Force -ErrorAction Stop`n"
+    if ($ConfigPath) {
+        $body += "`$c = Get-SyncConfig -Path $(ConvertTo-PsQuoted $ConfigPath)`n"
+        $body += "Write-Output ('DEFS=' + (Get-SyncDefinitionHash -Config `$c -AppDir $(ConvertTo-PsQuoted $AppDir)))`n"
+    } else { $body += "Write-Output 'DEFS=ok'`n" }
+    $script = "`$ErrorActionPreference = 'Stop'`ntry {`n$body exit 0`n} catch { [Console]::Error.WriteLine(`$_.Exception.Message); exit 1 }"
+    $r = Invoke-PowerShellChild -Script $script
+    $line = @($r.Out | Where-Object { $_ -like 'DEFS=*' } | Select-Object -Last 1)
+    if ($r.Code -ne 0 -or $line.Count -eq 0) { throw ('Module does not load: ' + (($r.Out -join ' ') -replace '\s+', ' ').Trim()) }
+    return $line[0].Substring(5)
+}
+
+function Test-UpdatePackage {
+    # Checks an unpacked release before it goes anywhere near the install folder.
+    param([Parameter(Mandatory)][string]$Dir, [Parameter(Mandatory)][string]$ExpectedVersion, [string]$ConfigPath, [string]$AppDir)
+    $root = (Resolve-Path -LiteralPath $Dir).ProviderPath.TrimEnd('\')
+    $files = @(Get-ChildItem -LiteralPath $root -Recurse -File)
+    Assert-ReleaseFiles -Paths @($files | ForEach-Object { $_.FullName.Substring($root.Length + 1) })
+    foreach ($f in $script:ReleaseRequired) {
+        if (-not (Test-Path -LiteralPath (Join-Path $root $f))) { throw "Package is missing $f" }
+    }
+    if ((Get-InstalledVersion -AppDir $root) -ne $ExpectedVersion) { throw "Package VERSION does not say $ExpectedVersion" }
+    foreach ($f in @($files | Where-Object { $_.Extension -in @('.ps1', '.psm1') })) {
+        $errs = $null
+        [void][Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$errs)
+        if (@($errs).Count -gt 0) { throw ("{0} does not parse: {1}" -f $f.Name, $errs[0].Message) }
+    }
+    return (Test-ModuleImport -ModulePath (Join-Path $root 'AroniumSync.psm1') -ConfigPath $ConfigPath -AppDir $AppDir)
+}
+
+function Copy-PackageIntoInstall {
+    # Copies every package file into AppDir. Before overwriting, saves the old file in BackupDir;
+    # files that did not exist yet are listed in BackupDir\added.txt so a rollback can remove them.
+    param([Parameter(Mandatory)][string]$Stage, [Parameter(Mandatory)][string]$AppDir, [Parameter(Mandatory)][string]$BackupDir)
+    $root = (Resolve-Path -LiteralPath $Stage).ProviderPath.TrimEnd('\')
+    $added = New-Object System.Collections.Generic.List[string]
+    $addedPath = Join-Path $BackupDir 'added.txt'
+    foreach ($f in @(Get-ChildItem -LiteralPath $root -Recurse -File)) {
+        $rel = $f.FullName.Substring($root.Length + 1)
+        $dest = Join-Path $AppDir $rel
+        $destDir = Split-Path -Parent $dest
+        if (-not (Test-Path -LiteralPath $destDir)) { New-Item -ItemType Directory -Force -Path $destDir | Out-Null }
+        if (Test-Path -LiteralPath $dest) {
+            $bak = Join-Path (Join-Path $BackupDir 'files') $rel
+            $bakDir = Split-Path -Parent $bak
+            if (-not (Test-Path -LiteralPath $bakDir)) { New-Item -ItemType Directory -Force -Path $bakDir | Out-Null }
+            Copy-Item -LiteralPath $dest -Destination $bak -Force
+        } else {
+            $added.Add($rel)
+            [IO.File]::WriteAllLines($addedPath, $added.ToArray())
+        }
+        Copy-Item -LiteralPath $f.FullName -Destination $dest -Force
+        Unblock-File -LiteralPath $dest -ErrorAction SilentlyContinue
+    }
+}
+
+function Restore-InstallFromBackup {
+    param([Parameter(Mandatory)][string]$AppDir, [Parameter(Mandatory)][string]$BackupDir)
+    $files = Join-Path $BackupDir 'files'
+    if (Test-Path -LiteralPath $files) {
+        $root = (Resolve-Path -LiteralPath $files).ProviderPath.TrimEnd('\')
+        foreach ($f in @(Get-ChildItem -LiteralPath $root -Recurse -File)) {
+            Copy-Item -LiteralPath $f.FullName -Destination (Join-Path $AppDir $f.FullName.Substring($root.Length + 1)) -Force
+        }
+    }
+    $addedPath = Join-Path $BackupDir 'added.txt'
+    if (Test-Path -LiteralPath $addedPath) {
+        foreach ($rel in [IO.File]::ReadAllLines($addedPath)) {
+            if (-not $rel) { continue }
+            $p = Join-Path $AppDir $rel
+            if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Force }
+        }
+    }
+}
+
+function Update-SyncRegistrations {
+    # Re-registers the role task, the update task and the toast link using the NEW module,
+    # in a child PowerShell (this process still has the old module loaded).
+    param([Parameter(Mandatory)][hashtable]$Config, [Parameter(Mandatory)][string]$AppDir)
+    $psm = Join-Path $AppDir 'AroniumSync.psm1'
+    $script = "`$ErrorActionPreference = 'Stop'`ntry {`nImport-Module $(ConvertTo-PsQuoted $psm) -Force`n" +
+    "`$c = Get-SyncConfig -Path $(ConvertTo-PsQuoted $Config.configPath)`n" +
+    "Register-SyncProtocol -HandlerScript $(ConvertTo-PsQuoted (Join-Path $AppDir 'protocol-handler.ps1'))`n" +
+    "Register-SyncTasks -Config `$c -Role `$c.role`nRegister-UpdateTask -Config `$c`nexit 0`n" +
+    "} catch { [Console]::Error.WriteLine(`$_.Exception.Message); exit 1 }"
+    $r = Invoke-PowerShellChild -Script $script
+    if ($r.Code -ne 0) { throw ('Re-registering tasks failed: ' + (($r.Out -join ' ') -replace '\s+', ' ').Trim()) }
+}
+
+function Invoke-SelfUpdate {
+    # Returns 'updated' | 'up-to-date' | 'disabled' | 'pinned' | 'busy' | 'failed'.
+    param(
+        [Parameter(Mandatory)][hashtable]$Config,
+        [string]$AppDir,
+        [string]$Version,
+        [switch]$Unpin,
+        [int]$MutexWaitSeconds = 60
+    )
+    if (-not $AppDir) { $AppDir = Split-Path -Parent $Config.configPath }
+    if ($Version -and $Version -notmatch $script:VersionPattern) {
+        Write-SyncLog -Config $Config -Level ERROR -Message "Update: '$Version' is not a version like v1.2.3."
+        return 'failed'
+    }
+    $state = Get-SyncState -Config $Config
+    if (-not $Version -and -not $Unpin) {
+        if ($Config.ContainsKey('autoUpdate') -and $Config.autoUpdate -eq $false) {
+            Write-SyncLog -Config $Config -Message 'Update: autoUpdate is off in config.json; not checking.'
+            return 'disabled'
+        }
+        if ($state.updatePin) {
+            Write-SyncLog -Config $Config -Message "Update: pinned to $($state.updatePin); not checking. Run update.ps1 -Unpin to follow new releases."
+            return 'pinned'
+        }
+    }
+    $mutex = Get-SyncMutex -Config $Config -WaitSeconds $MutexWaitSeconds
+    if (-not $mutex) { Write-SyncLog -Config $Config -Message 'Update skipped: a sync step is running.'; return 'busy' }
+    $work = $null
+    $backup = Join-Path $AppDir 'update-backup'
+    $copied = $false
+    $registered = $false
+    $tag = $(if ($Version) { $Version } else { 'latest' })
+    try {
+        $installed = Get-InstalledVersion -AppDir $AppDir
+        $rel = Get-UpdateRelease -Version $Version
+        $tag = [string]$rel.tag_name
+        if ($tag -notmatch $script:VersionPattern) { throw "release tag '$tag' is not a version like v1.2.3" }
+        if ($Version -and $tag -ne $Version) { throw "asked for $Version but GitHub returned $tag" }
+        $cmp = (ConvertTo-SyncVersion $tag).CompareTo((ConvertTo-SyncVersion $installed))
+        if (($Version -and $cmp -eq 0) -or (-not $Version -and $cmp -le 0)) {
+            $state = Get-SyncState -Config $Config
+            $state.updatePin = $(if ($Version) { $Version } else { $null })
+            Save-SyncState -Config $Config -State $state
+            Write-SyncLog -Config $Config -Message "Update: $installed is installed; release $tag is not newer. Nothing to do."
+            return 'up-to-date'
+        }
+
+        $zipName = "ar-sync-$tag.zip"
+        $zipAsset = @($rel.assets | Where-Object { $_.name -eq $zipName }) | Select-Object -First 1
+        $shaAsset = @($rel.assets | Where-Object { $_.name -eq "$zipName.sha256" }) | Select-Object -First 1
+        if (-not $zipAsset -or -not $shaAsset) { throw "release $tag is missing $zipName or $zipName.sha256" }
+        foreach ($a in @($zipAsset, $shaAsset)) {
+            if (-not (Test-UpdateUrl ([string]$a.browser_download_url))) { throw "refusing download from $($a.browser_download_url)" }
+        }
+
+        $work = Join-Path $env:TEMP ('ar-sync-update-' + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Force -Path $work | Out-Null
+        $zip = Join-Path $work $zipName
+        $shaFile = $zip + '.sha256'
+        Invoke-UpdateDownload -Url ([string]$zipAsset.browser_download_url) -OutFile $zip
+        Invoke-UpdateDownload -Url ([string]$shaAsset.browser_download_url) -OutFile $shaFile
+        if (-not (Test-Path -LiteralPath $zip) -or -not (Test-Path -LiteralPath $shaFile)) { throw 'download did not produce both files' }
+        $expected = (([IO.File]::ReadAllText($shaFile).Trim() -split '\s+')[0]).ToLowerInvariant()
+        if ($expected -notmatch '^[0-9a-f]{64}$') { throw "$zipName.sha256 does not hold a SHA-256 hash" }
+        if ((Get-FileSha256 $zip) -ne $expected) { throw "hash mismatch on $zipName; not installing it" }
+
+        $stage = Join-Path $work 'stage'
+        Expand-Archive -LiteralPath $zip -DestinationPath $stage -Force
+        $newDefs = Test-UpdatePackage -Dir $stage -ExpectedVersion $tag -ConfigPath $Config.configPath -AppDir $AppDir
+        $oldDefs = Get-SyncDefinitionHash -Config $Config -AppDir $AppDir
+
+        if (Test-Path -LiteralPath $backup) { Remove-Item -LiteralPath $backup -Recurse -Force }
+        New-Item -ItemType Directory -Force -Path $backup | Out-Null
+        $copied = $true
+        Copy-PackageIntoInstall -Stage $stage -AppDir $AppDir -BackupDir $backup
+        if ((Get-InstalledVersion -AppDir $AppDir) -ne $tag) { throw 'VERSION in the install folder does not match after copying' }
+        [void](Test-ModuleImport -ModulePath (Join-Path $AppDir 'AroniumSync.psm1'))
+        if ($newDefs -ne $oldDefs) {
+            $registered = $true
+            Update-SyncRegistrations -Config $Config -AppDir $AppDir
+            Write-SyncLog -Config $Config -Message 'Update: task or link definitions changed; re-registered them.'
+        }
+
+        $state = Get-SyncState -Config $Config
+        $state.updatePin = $(if ($Version) { $Version } else { $null })
+        Save-SyncState -Config $Config -State $state
+        Write-SyncLog -Config $Config -Message "Update: $installed -> $tag installed."
+        Show-SyncToast -Config $Config -Kind 'tool-update' -Text "Sync tool updated to $tag."
+        return 'updated'
+    } catch {
+        $reason = $_.Exception.Message
+        if ($copied) {
+            try {
+                Restore-InstallFromBackup -AppDir $AppDir -BackupDir $backup
+                if ($registered) {
+                    Register-SyncProtocol -HandlerScript (Join-Path $AppDir 'protocol-handler.ps1')
+                    Register-SyncTasks -Config $Config -Role $Config.role
+                    Register-UpdateTask -Config $Config
+                }
+                $reason += ' Rolled back to the previous version.'
+            } catch { $reason += ' ROLLBACK FAILED: ' + $_.Exception.Message }
+        }
+        Write-SyncLog -Config $Config -Level ERROR -Message "Update to $tag failed: $reason"
+        Show-SyncToast -Config $Config -Kind 'tool-update' -Text "Sync tool update to $tag failed: $reason"
+        return 'failed'
+    } finally {
+        if ($work -and (Test-Path -LiteralPath $work)) { Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue }
+        Exit-SyncMutex $mutex
+    }
+}
+
+function Get-UpdateTaskXml {
+    # Daily at 03:00 (or as soon as the laptop is on after that) and 10 minutes after logon.
+    param([Parameter(Mandatory)][string]$ScriptPath, [Parameter(Mandatory)][string]$UserId, [datetime]$Start = (Get-Date).Date)
+    $esc = { param($s) [System.Security.SecurityElement]::Escape([string]$s) }
+    $startStr = $Start.Date.AddHours(3).ToString('yyyy-MM-ddTHH:mm:ss', [Globalization.CultureInfo]::InvariantCulture)
+    $cmdArgs = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}"' -f $ScriptPath
+    return @"
+<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Description>Aronium Sync (update from GitHub releases)</Description></RegistrationInfo>
+  <Triggers>
+    <CalendarTrigger>
+      <StartBoundary>$startStr</StartBoundary>
+      <Enabled>true</Enabled>
+      <ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay>
+    </CalendarTrigger>
+    <LogonTrigger><Enabled>true</Enabled><UserId>$(& $esc $UserId)</UserId><Delay>PT10M</Delay></LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>$(& $esc $UserId)</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>true</RunOnlyIfNetworkAvailable>
+    <ExecutionTimeLimit>PT30M</ExecutionTimeLimit>
+    <Enabled>true</Enabled>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>$(& $esc (Get-PowerShellExe))</Command>
+      <Arguments>$(& $esc $cmdArgs)</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+"@
+}
+
+function Register-UpdateTask {
+    param([Parameter(Mandatory)][hashtable]$Config)
+    $appDir = Split-Path -Parent $Config.configPath
+    $user = '{0}\{1}' -f $env:USERDOMAIN, $env:USERNAME
+    $xml = Get-UpdateTaskXml -ScriptPath (Join-Path $appDir 'update.ps1') -UserId $user
+    Register-ScheduledTask -TaskName $script:UpdateTaskName -Xml $xml -Force -ErrorAction Stop | Out-Null
+}
+
+function New-ReleasePackage {
+    # Builds ar-sync-<tag>.zip (files at the zip root) and ar-sync-<tag>.zip.sha256 in OutDir.
+    # Files are paths relative to Root. Returns @{ Zip; Sha256File; Hash }.
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [Parameter(Mandatory)][string]$Version,
+        [Parameter(Mandatory)][string[]]$Files,
+        [Parameter(Mandatory)][string]$OutDir
+    )
+    if ($Version -notmatch $script:VersionPattern) { throw "'$Version' is not a version like v1.2.3" }
+    Assert-ReleaseFiles -Paths $Files
+    foreach ($f in $script:ReleaseRequired) { if ($Files -notcontains $f) { throw "Release must include $f" } }
+    if ((Get-InstalledVersion -AppDir $Root) -ne $Version) { throw "VERSION says $(Get-InstalledVersion -AppDir $Root), not $Version" }
+    if (-not (Test-Path -LiteralPath $OutDir)) { New-Item -ItemType Directory -Force -Path $OutDir | Out-Null }
+    $zip = Join-Path $OutDir "ar-sync-$Version.zip"
+    if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
+    Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+    $archive = [IO.Compression.ZipFile]::Open($zip, [IO.Compression.ZipArchiveMode]::Create)
+    try {
+        foreach ($f in $Files) {
+            $src = Join-Path $Root $f
+            if (-not (Test-Path -LiteralPath $src -PathType Leaf)) { throw "Missing file: $f" }
+            [void][IO.Compression.ZipFileExtensions]::CreateEntryFromFile($archive, $src, $f.Replace('\', '/'))
+        }
+    } finally { $archive.Dispose() }
+    $hash = Get-FileSha256 $zip
+    $shaFile = $zip + '.sha256'
+    [IO.File]::WriteAllText($shaFile, ("{0}  ar-sync-{1}.zip`n" -f $hash, $Version), (New-Object Text.UTF8Encoding $false))
+    return @{ Zip = $zip; Sha256File = $shaFile; Hash = $hash }
 }
 
 Export-ModuleMember -Function *-*

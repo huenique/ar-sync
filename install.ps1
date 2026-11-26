@@ -11,6 +11,7 @@
 #   5. Registers the aronium-sync: link used by toast buttons (HKCU only)
 #   6. Registers the scheduled task: publish every 15 min (seller) or check every 5 min (reader)
 #   7. Puts "Aronium Sync - Clear pause" (and on the reader "Aronium Sync - Take over") on the desktop
+#   Also registers "AroniumSync Update" (daily 03:00 + 10 min after logon; see update.ps1).
 #
 # -AroniumProcessName: the name Get-Process shows for Aronium (default: the exe file name).
 #   It is checked against the running Aronium; leave Aronium open during install to verify it.
@@ -57,7 +58,7 @@ Write-Host "Installing Aronium Sync ($Role) for $env:USERNAME ..."
 # 1. scripts
 New-Item -ItemType Directory -Force -Path $app, (Join-Path $app 'bin'), (Join-Path $app 'backups'), (Join-Path $app 'state') | Out-Null
 foreach ($f in @('AroniumSync.psm1', 'publish.ps1', 'check.ps1', 'takeover.ps1', 'update-now.ps1', 'protocol-handler.ps1',
-        'clear-pause.ps1', 'set-role.ps1', 'uninstall.ps1', 'README.md', 'VERIFY.md')) {
+        'clear-pause.ps1', 'set-role.ps1', 'update.ps1', 'uninstall.ps1', 'README.md', 'VERIFY.md', 'VERSION')) {
     $p = Join-Path $src $f
     if (Test-Path -LiteralPath $p) { Copy-Item -LiteralPath $p -Destination $app -Force }
 }
@@ -122,6 +123,7 @@ if (Test-Path -LiteralPath $cfgPath) {
         ownerContact       = $OwnerContact
         historyDays        = 30
         keepBackups        = 10
+        autoUpdate         = $true
     }
     [IO.File]::WriteAllText($cfgPath, ($obj | ConvertTo-Json -Depth 5), (New-Object Text.UTF8Encoding $false))
     $cfg = Get-SyncConfig -Path $cfgPath
@@ -168,6 +170,7 @@ Set-SyncConfigRole -Config $cfg -Role $Role
 # 5. toast button link, 6. scheduled task
 Register-SyncProtocol -HandlerScript (Join-Path $app 'protocol-handler.ps1')
 Register-SyncTasks -Config $cfg -Role $Role
+Register-UpdateTask -Config $cfg
 
 # 7. desktop shortcuts
 Set-SyncShortcuts -Config $cfg -Role $Role

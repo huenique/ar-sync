@@ -13,7 +13,7 @@ param([switch]$Purge)
 $ErrorActionPreference = 'Stop'
 $app = Join-Path $env:LOCALAPPDATA 'AroniumSync'
 
-foreach ($n in @('AroniumSync Publish', 'AroniumSync Check')) {
+foreach ($n in @('AroniumSync Publish', 'AroniumSync Check', 'AroniumSync Update')) {
     Unregister-ScheduledTask -TaskName $n -Confirm:$false -ErrorAction SilentlyContinue
 }
 $key = 'HKCU:\Software\Classes\aronium-sync'

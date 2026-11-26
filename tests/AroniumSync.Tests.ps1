@@ -21,6 +21,9 @@ BeforeAll {
         Mock Register-SyncTasks -ModuleName AroniumSync { }
         Mock Register-SyncProtocol -ModuleName AroniumSync { }
         Mock Set-SyncShortcuts -ModuleName AroniumSync { }
+        Mock Register-UpdateTask -ModuleName AroniumSync { }
+        Mock Update-SyncRegistrations -ModuleName AroniumSync { }
+        Mock Invoke-UpdateHttp -ModuleName AroniumSync { throw 'network must be mocked in tests' }
         Mock Stop-Process -ModuleName AroniumSync { throw 'Stop-Process must never be called' }
     }
 
@@ -763,5 +766,231 @@ Describe 'Seller switch guard and hand-back (<Kind> DB)' -ForEach $Cases {
         Invoke-Check -Config $B -Now $Now.AddMinutes(116) -HostName 'LAPTOP-B' | Should -Be 'restored'
         Get-DocCount $B.dbPath | Should -Be (Get-DocCount $A.dbPath)
         Get-TestMarker -Database $B.dbPath | Should -Be 'reader'
+    }
+}
+
+Describe 'Self-update' {
+    BeforeAll {
+        $script:RuntimeFiles = @(Get-ChildItem -LiteralPath $RepoRoot -File | Where-Object {
+                $_.Name -match '\.(ps1|psm1|md)$' -or $_.Name -in @('VERSION', 'config.example.json') } | ForEach-Object { $_.Name })
+
+        function New-FakeInstall {
+            # An installed laptop at v1.0.0 with config, state, backups, bin, log and a pause flag.
+            $root = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
+            $cfg = New-TestLaptop -Root $root -Name 'A' -Role seller
+            $app = Split-Path -Parent $cfg.configPath
+            foreach ($f in $script:RuntimeFiles) { Copy-Item -LiteralPath (Join-Path $RepoRoot $f) -Destination $app }
+            [IO.File]::WriteAllText((Join-Path $app 'VERSION'), "v1.0.0`n")
+            New-Item -ItemType Directory -Force -Path (Join-Path $app 'state'), (Join-Path $app 'backups'), (Join-Path $app 'bin') | Out-Null
+            Save-SyncState -Config $cfg -State @{ lastPublishedAt = '2026-11-26T09:45:00+08:00' }
+            Set-Content -LiteralPath (Join-Path $app 'backups\pos-20261126-090000.bak') -Value 'old data'
+            Set-Content -LiteralPath (Join-Path $app 'bin\sqlite3.exe') -Value 'not really sqlite'
+            Set-Content -LiteralPath (Join-Path $app 'sync.log') -Value 'FIRST LINE'
+            Set-Content -LiteralPath (Join-Path $app 'SYNC-PAUSED.txt') -Value 'paused'
+            return @{ Cfg = $cfg; App = $app }
+        }
+
+        function Get-ProgramHashes {
+            # Hashes of the program files (not config/state/backups/bin/log).
+            param([string]$App)
+            $h = @{}
+            foreach ($f in Get-ChildItem -LiteralPath $App -File | Where-Object { $_.Name -match '\.(ps1|psm1|md)$' -or $_.Name -eq 'VERSION' }) {
+                $h[$f.Name] = Get-FileSha256 $f.FullName
+            }
+            return $h
+        }
+
+        function New-FakeRelease {
+            # Builds ar-sync-<Tag>.zip + .sha256 from the repo files, optionally tampered with.
+            param([string]$Tag, [scriptblock]$Tamper, [string[]]$Extra = @())
+            $src = Join-Path $TestDrive ('rel-' + [guid]::NewGuid().ToString('N'))
+            New-Item -ItemType Directory -Force -Path $src | Out-Null
+            foreach ($f in $script:RuntimeFiles) { Copy-Item -LiteralPath (Join-Path $RepoRoot $f) -Destination $src }
+            [IO.File]::WriteAllText((Join-Path $src 'VERSION'), "$Tag`n")
+            foreach ($e in $Extra) { Set-Content -LiteralPath (Join-Path $src $e) -Value '# added in this release' }
+            if ($Tamper) { & $Tamper $src }
+            $pkg = New-ReleasePackage -Root $src -Version $Tag -Files ($script:RuntimeFiles + $Extra) -OutDir (Join-Path $src 'out')
+            $global:ArSyncFakeDir = Join-Path $src 'out'
+            $global:ArSyncFakeTag = $Tag
+            $global:ArSyncFakeAssets = @("ar-sync-$Tag.zip", "ar-sync-$Tag.zip.sha256")
+            return $pkg
+        }
+    }
+
+    BeforeEach {
+        Initialize-Mocks
+        Mock Invoke-UpdateApi -ModuleName AroniumSync {
+            [pscustomobject]@{
+                tag_name = $global:ArSyncFakeTag
+                assets   = @($global:ArSyncFakeAssets | ForEach-Object {
+                        [pscustomobject]@{ name = $_; browser_download_url = "https://github.com/huenique/ar-sync/releases/download/$($global:ArSyncFakeTag)/$_" } })
+            }
+        }
+        Mock Invoke-UpdateDownload -ModuleName AroniumSync { Copy-Item -LiteralPath (Join-Path $global:ArSyncFakeDir (Split-Path -Leaf $Url)) -Destination $OutFile }
+        $I = New-FakeInstall
+        $before = Get-ProgramHashes $I.App
+    }
+    AfterEach { Remove-Variable -Name ArSyncFakeDir, ArSyncFakeTag, ArSyncFakeAssets -Scope Global -ErrorAction SilentlyContinue }
+
+    It 'installs a newer release, toasts, and leaves config, state, backups, bin, log and pause flag alone' {
+        $keep = @{}
+        foreach ($p in @('config.json', 'backups\pos-20261126-090000.bak', 'bin\sqlite3.exe', 'SYNC-PAUSED.txt')) { $keep[$p] = Get-FileSha256 (Join-Path $I.App $p) }
+        New-FakeRelease -Tag 'v1.1.0' | Out-Null
+        Invoke-SelfUpdate -Config $I.Cfg -AppDir $I.App | Should -Be 'updated'
+        Get-InstalledVersion -AppDir $I.App | Should -Be 'v1.1.0'
+        foreach ($p in $keep.Keys) { Get-FileSha256 (Join-Path $I.App $p) | Should -Be $keep[$p] }
+        (Get-SyncState -Config $I.Cfg).lastPublishedAt | Should -Be '2026-11-26T09:45:00+08:00'
+        (Get-Content -LiteralPath (Join-Path $I.App 'sync.log'))[0] | Should -Be 'FIRST LINE'
+        Should -Invoke Show-SyncToast -ModuleName AroniumSync -Times 1 -Exactly -ParameterFilter { $Text -eq 'Sync tool updated to v1.1.0.' }
+        # same task definitions, so Task Scheduler and the registry are left alone
+        Should -Invoke Update-SyncRegistrations -ModuleName AroniumSync -Times 0 -Exactly
+    }
+
+    It 'does nothing when the latest release is the installed version' {
+        New-FakeRelease -Tag 'v1.0.0' | Out-Null
+        Invoke-SelfUpdate -Config $I.Cfg -AppDir $I.App | Should -Be 'up-to-date'
+        Should -Invoke Invoke-UpdateDownload -ModuleName AroniumSync -Times 0 -Exactly
+        Should -Invoke Show-SyncToast -ModuleName AroniumSync -Times 0 -Exactly
+    }
+
+    It 'never downgrades on its own when the latest release is older' {
+        New-FakeRelease -Tag 'v0.9.0' | Out-Null
+        Invoke-SelfUpdate -Config $I.Cfg -AppDir $I.App | Should -Be 'up-to-date'
+        Get-InstalledVersion -AppDir $I.App | Should -Be 'v1.0.0'
+        Should -Invoke Invoke-UpdateDownload -ModuleName AroniumSync -Times 0 -Exactly
+    }
+
+    It '-Version installs that exact (older) release and pins it; -Unpin follows releases again' {
+        New-FakeRelease -Tag 'v0.9.0' | Out-Null
+        Invoke-SelfUpdate -Config $I.Cfg -AppDir $I.App -Version 'v0.9.0' | Should -Be 'updated'
+        Should -Invoke Invoke-UpdateApi -ModuleName AroniumSync -Times 1 -Exactly -ParameterFilter { $Url -like '*/releases/tags/v0.9.0' }
+        Get-InstalledVersion -AppDir $I.App | Should -Be 'v0.9.0'
+        New-FakeRelease -Tag 'v1.1.0' | Out-Null
+        Invoke-SelfUpdate -Config $I.Cfg -AppDir $I.App | Should -Be 'pinned'
+        Get-InstalledVersion -AppDir $I.App | Should -Be 'v0.9.0'
+        Invoke-SelfUpdate -Config $I.Cfg -AppDir $I.App -Unpin | Should -Be 'updated'
+        Get-InstalledVersion -AppDir $I.App | Should -Be 'v1.1.0'
+        (Get-SyncState -Config $I.Cfg).updatePin | Should -BeNullOrEmpty
+    }
+
+    It 'aborts on a hash mismatch and changes nothing' {
+        $pkg = New-FakeRelease -Tag 'v1.1.0'
+        [IO.File]::WriteAllText($pkg.Sha256File, ('0' * 64) + "  ar-sync-v1.1.0.zip`n")
+        Invoke-SelfUpdate -Config $I.Cfg -AppDir $I.App | Should -Be 'failed'
+        $after = Get-ProgramHashes $I.App
+        foreach ($k in $before.Keys) { $after[$k] | Should -Be $before[$k] }
+        Should -Invoke Show-SyncToast -ModuleName AroniumSync -Times 1 -Exactly -ParameterFilter { $Text -like '*failed*hash mismatch*' }
+    }
+
+    It 'aborts when the release has no .sha256 asset' {
+        New-FakeRelease -Tag 'v1.1.0' | Out-Null
+        $global:ArSyncFakeAssets = @('ar-sync-v1.1.0.zip')
+        Invoke-SelfUpdate -Config $I.Cfg -AppDir $I.App | Should -Be 'failed'
+        Get-InstalledVersion -AppDir $I.App | Should -Be 'v1.0.0'
+        Should -Invoke Invoke-UpdateDownload -ModuleName AroniumSync -Times 0 -Exactly
+    }
+
+    It 'refuses a package whose script does not parse, before touching the install' {
+        New-FakeRelease -Tag 'v1.1.0' -Tamper { param($d) Add-Content -LiteralPath (Join-Path $d 'check.ps1') -Value 'function { broken' } | Out-Null
+        Invoke-SelfUpdate -Config $I.Cfg -AppDir $I.App | Should -Be 'failed'
+        $after = Get-ProgramHashes $I.App
+        foreach ($k in $before.Keys) { $after[$k] | Should -Be $before[$k] }
+        Test-Path (Join-Path $I.App 'update-backup') | Should -BeFalse
+    }
+
+    It 'refuses a corrupt zip' {
+        $pkg = New-FakeRelease -Tag 'v1.1.0'
+        [IO.File]::WriteAllBytes($pkg.Zip, [byte[]](1..200))
+        $h = Get-FileSha256 $pkg.Zip
+        [IO.File]::WriteAllText($pkg.Sha256File, "$h  ar-sync-v1.1.0.zip`n")
+        Invoke-SelfUpdate -Config $I.Cfg -AppDir $I.App | Should -Be 'failed'
+        Get-InstalledVersion -AppDir $I.App | Should -Be 'v1.0.0'
+    }
+
+    It 're-registers tasks only when their definitions changed' {
+        New-FakeRelease -Tag 'v1.1.0' -Tamper { param($d)
+            $p = Join-Path $d 'AroniumSync.psm1'
+            [IO.File]::WriteAllText($p, [IO.File]::ReadAllText($p).Replace("'PT15M'", "'PT20M'")) } | Out-Null
+        Invoke-SelfUpdate -Config $I.Cfg -AppDir $I.App | Should -Be 'updated'
+        Should -Invoke Update-SyncRegistrations -ModuleName AroniumSync -Times 1 -Exactly
+    }
+
+    It 'rolls back every file when a step after the copy fails' {
+        Mock Update-SyncRegistrations -ModuleName AroniumSync { throw 'Task Scheduler said no' }
+        New-FakeRelease -Tag 'v1.1.0' -Extra @('brand-new.ps1') -Tamper { param($d)
+            $p = Join-Path $d 'AroniumSync.psm1'
+            [IO.File]::WriteAllText($p, [IO.File]::ReadAllText($p).Replace("'PT15M'", "'PT20M'")) } | Out-Null
+        Invoke-SelfUpdate -Config $I.Cfg -AppDir $I.App | Should -Be 'failed'
+        $after = Get-ProgramHashes $I.App
+        $after.Count | Should -Be $before.Count
+        foreach ($k in $before.Keys) { $after[$k] | Should -Be $before[$k] }
+        Test-Path (Join-Path $I.App 'brand-new.ps1') | Should -BeFalse
+        Should -Invoke Register-SyncTasks -ModuleName AroniumSync -Times 1 -Exactly
+        Should -Invoke Show-SyncToast -ModuleName AroniumSync -Times 1 -Exactly -ParameterFilter { $Text -like '*Task Scheduler said no*Rolled back*' }
+    }
+
+    It 'does not check at all when autoUpdate is off' {
+        Set-SyncConfigField -Config $I.Cfg -Name 'autoUpdate' -Value $false
+        Invoke-SelfUpdate -Config (Get-SyncConfig -Path $I.Cfg.configPath) -AppDir $I.App | Should -Be 'disabled'
+        Should -Invoke Invoke-UpdateApi -ModuleName AroniumSync -Times 0 -Exactly
+    }
+
+    It 'waits for a running sync step (same mutex) and does nothing if it does not finish' {
+        New-FakeRelease -Tag 'v1.1.0' | Out-Null
+        $held = New-Object Threading.ManualResetEvent $false
+        $done = New-Object Threading.ManualResetEvent $false
+        $ps = [powershell]::Create()
+        [void]$ps.AddScript({ param($name, $held, $done)
+                $m = New-Object Threading.Mutex($false, $name)
+                [void]$m.WaitOne(); [void]$held.Set(); [void]$done.WaitOne(30000); $m.ReleaseMutex(); $m.Dispose() }).AddArgument($I.Cfg.mutexName).AddArgument($held).AddArgument($done)
+        $h = $ps.BeginInvoke()
+        try {
+            $held.WaitOne(10000) | Should -BeTrue
+            Invoke-SelfUpdate -Config $I.Cfg -AppDir $I.App -MutexWaitSeconds 1 | Should -Be 'busy'
+            Get-InstalledVersion -AppDir $I.App | Should -Be 'v1.0.0'
+            Should -Invoke Invoke-UpdateApi -ModuleName AroniumSync -Times 0 -Exactly
+        } finally { [void]$done.Set(); [void]$ps.EndInvoke($h); $ps.Dispose() }
+        Invoke-SelfUpdate -Config $I.Cfg -AppDir $I.App -MutexWaitSeconds 1 | Should -Be 'updated'
+    }
+}
+
+Describe 'Self-update guards' {
+    It 'allows only GitHub over HTTPS: <Url> -> <Ok>' -ForEach @(
+        @{ Url = 'https://api.github.com/repos/huenique/ar-sync/releases/latest'; Ok = $true }
+        @{ Url = 'https://github.com/huenique/ar-sync/releases/download/v1.0.0/ar-sync-v1.0.0.zip'; Ok = $true }
+        @{ Url = 'https://objects.githubusercontent.com/x'; Ok = $true }
+        @{ Url = 'http://github.com/huenique/ar-sync/releases/download/v1.0.0/x.zip'; Ok = $false }
+        @{ Url = 'https://github.com.evil.example/x.zip'; Ok = $false }
+        @{ Url = 'https://evil.example/github.com/x.zip'; Ok = $false }
+        @{ Url = 'https://github.com:8443/x.zip'; Ok = $false }
+        @{ Url = 'file:///C:/x.zip'; Ok = $false }
+        @{ Url = ''; Ok = $false }
+    ) {
+        Test-UpdateUrl $Url | Should -Be $Ok
+    }
+
+    It 'refuses to package <Path>' -ForEach @(
+        @{ Path = 'pos.db' }, @{ Path = 'fixtures/real.db' }, @{ Path = 'fixtures\notes.txt' }, @{ Path = 'config.json' },
+        @{ Path = 'sync.log' }, @{ Path = 'state/state.json' }
+    ) {
+        { Assert-ReleaseFiles -Paths @('AroniumSync.psm1', $Path) } | Should -Throw '*Refusing to package*'
+    }
+
+    It 'packages the normal runtime files' {
+        { Assert-ReleaseFiles -Paths @('AroniumSync.psm1', 'update.ps1', 'config.example.json', 'README.md', 'VERSION') } | Should -Not -Throw
+    }
+
+    It 'the repo VERSION file is a valid version' {
+        Get-InstalledVersion -AppDir $RepoRoot | Should -Match '^v\d+\.\d+\.\d+$'
+        Get-InstalledVersion -AppDir $RepoRoot | Should -Not -Be 'v0.0.0'
+    }
+
+    It 'update task runs daily at 03:00 and 10 min after logon, as the logged-on user' {
+        [xml]$x = Get-UpdateTaskXml -ScriptPath 'C:\x\update.ps1' -UserId 'PC\shop' -Start ([datetime]'2026-11-26')
+        $x.Task.Triggers.CalendarTrigger.StartBoundary | Should -Be '2026-11-26T03:00:00'
+        $x.Task.Triggers.CalendarTrigger.ScheduleByDay.DaysInterval | Should -Be '1'
+        $x.Task.Triggers.LogonTrigger.Delay | Should -Be 'PT10M'
+        $x.Task.Principals.Principal.LogonType | Should -Be 'InteractiveToken'
+        $x.Task.Actions.Exec.Arguments | Should -Match 'update\.ps1'
     }
 }
