@@ -131,7 +131,7 @@ If more sales are made on the viewing laptop after you clear the pause, it pause
 Clients only ever install **published GitHub releases**. Pushing to `master` changes nothing on the laptops.
 
 1. Make the change, run the tests, commit and push to `master`.
-2. Bump `VERSION`, for example `v1.0.0` to `v1.1.0`, using `vMAJOR.MINOR.PATCH`. Commit and push it.
+2. Bump `VERSION`, for example `v1.0.0` to `v1.1.0`, using `vMAJOR.MINOR.PATCH`. Add a short entry to `CHANGELOG.md`. Commit and push both.
 3. Build and check the package without publishing:
    ```
    powershell -ExecutionPolicy Bypass -File tools\make-release.ps1 -NoUpload
