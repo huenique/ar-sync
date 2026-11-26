@@ -53,6 +53,64 @@ BeforeAll {
         }
         return $h
     }
+
+    $script:RuntimeFiles = @(Get-ChildItem -LiteralPath $RepoRoot -File | Where-Object {
+            $_.Name -match '\.(ps1|psm1|md)$' -or $_.Name -in @('VERSION', 'config.example.json') } | ForEach-Object { $_.Name })
+
+    function New-FakeInstall {
+        param([string]$Root)
+        # An installed laptop at v1.0.0 with config, state, backups, bin, log and a pause flag.
+        $root = Join-Path $(if ($Root) { $Root } else { $TestDrive }) ([guid]::NewGuid().ToString('N'))
+        $cfg = New-TestLaptop -Root $root -Name 'A' -Role seller
+        $app = Split-Path -Parent $cfg.configPath
+        foreach ($f in $script:RuntimeFiles) { Copy-Item -LiteralPath (Join-Path $RepoRoot $f) -Destination $app }
+        [IO.File]::WriteAllText((Join-Path $app 'VERSION'), "v1.0.0`n")
+        New-Item -ItemType Directory -Force -Path (Join-Path $app 'state'), (Join-Path $app 'backups'), (Join-Path $app 'bin') | Out-Null
+        Save-SyncState -Config $cfg -State @{ lastPublishedAt = '2026-11-26T09:45:00+08:00' }
+        Set-Content -LiteralPath (Join-Path $app 'backups\pos-20261126-090000.bak') -Value 'old data'
+        Set-Content -LiteralPath (Join-Path $app 'bin\sqlite3.exe') -Value 'not really sqlite'
+        Set-Content -LiteralPath (Join-Path $app 'sync.log') -Value 'FIRST LINE'
+        Set-Content -LiteralPath (Join-Path $app 'SYNC-PAUSED.txt') -Value 'paused'
+        return @{ Cfg = $cfg; App = $app }
+    }
+
+    function Get-ProgramHashes {
+        # Hashes of the program files (not config/state/backups/bin/log).
+        param([string]$App)
+        $h = @{}
+        foreach ($f in Get-ChildItem -LiteralPath $App -File | Where-Object { $_.Name -match '\.(ps1|psm1|md)$' -or $_.Name -eq 'VERSION' }) {
+            $h[$f.Name] = Get-FileSha256 $f.FullName
+        }
+        return $h
+    }
+
+    function New-FakeRelease {
+        # Builds ar-sync-<Tag>.zip + .sha256 from the repo files, optionally tampered with.
+        param([string]$Tag, [scriptblock]$Tamper, [string[]]$Extra = @())
+        $src = Join-Path $TestDrive ('rel-' + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Force -Path $src | Out-Null
+        foreach ($f in $script:RuntimeFiles) { Copy-Item -LiteralPath (Join-Path $RepoRoot $f) -Destination $src }
+        [IO.File]::WriteAllText((Join-Path $src 'VERSION'), "$Tag`n")
+        foreach ($e in $Extra) { Set-Content -LiteralPath (Join-Path $src $e) -Value '# added in this release' }
+        if ($Tamper) { & $Tamper $src }
+        $pkg = New-ReleasePackage -Root $src -Version $Tag -Files ($script:RuntimeFiles + $Extra) -OutDir (Join-Path $src 'out')
+        $global:ArSyncFakeDir = Join-Path $src 'out'
+        $global:ArSyncFakeTag = $Tag
+        $global:ArSyncFakeAssets = @("ar-sync-$Tag.zip", "ar-sync-$Tag.zip.sha256")
+        return $pkg
+    }
+
+    function Set-FakeGitHub {
+        # Network mocks: the API returns the fake release, downloads copy from its out folder.
+        Mock Invoke-UpdateApi -ModuleName AroniumSync {
+            [pscustomobject]@{
+                tag_name = $global:ArSyncFakeTag
+                assets   = @($global:ArSyncFakeAssets | ForEach-Object {
+                        [pscustomobject]@{ name = $_; browser_download_url = "https://github.com/huenique/ar-sync/releases/download/$($global:ArSyncFakeTag)/$_" } })
+            }
+        }
+        Mock Invoke-UpdateDownload -ModuleName AroniumSync { Copy-Item -LiteralPath (Join-Path $global:ArSyncFakeDir (Split-Path -Leaf $Url)) -Destination $OutFile }
+    }
 }
 
 Describe 'Publish (<Kind> DB)' -ForEach $Cases {
@@ -786,52 +844,6 @@ Describe 'Seller switch guard and hand-back (<Kind> DB)' -ForEach $Cases {
 }
 
 Describe 'Self-update' {
-    BeforeAll {
-        $script:RuntimeFiles = @(Get-ChildItem -LiteralPath $RepoRoot -File | Where-Object {
-                $_.Name -match '\.(ps1|psm1|md)$' -or $_.Name -in @('VERSION', 'config.example.json') } | ForEach-Object { $_.Name })
-
-        function New-FakeInstall {
-            # An installed laptop at v1.0.0 with config, state, backups, bin, log and a pause flag.
-            $root = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
-            $cfg = New-TestLaptop -Root $root -Name 'A' -Role seller
-            $app = Split-Path -Parent $cfg.configPath
-            foreach ($f in $script:RuntimeFiles) { Copy-Item -LiteralPath (Join-Path $RepoRoot $f) -Destination $app }
-            [IO.File]::WriteAllText((Join-Path $app 'VERSION'), "v1.0.0`n")
-            New-Item -ItemType Directory -Force -Path (Join-Path $app 'state'), (Join-Path $app 'backups'), (Join-Path $app 'bin') | Out-Null
-            Save-SyncState -Config $cfg -State @{ lastPublishedAt = '2026-11-26T09:45:00+08:00' }
-            Set-Content -LiteralPath (Join-Path $app 'backups\pos-20261126-090000.bak') -Value 'old data'
-            Set-Content -LiteralPath (Join-Path $app 'bin\sqlite3.exe') -Value 'not really sqlite'
-            Set-Content -LiteralPath (Join-Path $app 'sync.log') -Value 'FIRST LINE'
-            Set-Content -LiteralPath (Join-Path $app 'SYNC-PAUSED.txt') -Value 'paused'
-            return @{ Cfg = $cfg; App = $app }
-        }
-
-        function Get-ProgramHashes {
-            # Hashes of the program files (not config/state/backups/bin/log).
-            param([string]$App)
-            $h = @{}
-            foreach ($f in Get-ChildItem -LiteralPath $App -File | Where-Object { $_.Name -match '\.(ps1|psm1|md)$' -or $_.Name -eq 'VERSION' }) {
-                $h[$f.Name] = Get-FileSha256 $f.FullName
-            }
-            return $h
-        }
-
-        function New-FakeRelease {
-            # Builds ar-sync-<Tag>.zip + .sha256 from the repo files, optionally tampered with.
-            param([string]$Tag, [scriptblock]$Tamper, [string[]]$Extra = @())
-            $src = Join-Path $TestDrive ('rel-' + [guid]::NewGuid().ToString('N'))
-            New-Item -ItemType Directory -Force -Path $src | Out-Null
-            foreach ($f in $script:RuntimeFiles) { Copy-Item -LiteralPath (Join-Path $RepoRoot $f) -Destination $src }
-            [IO.File]::WriteAllText((Join-Path $src 'VERSION'), "$Tag`n")
-            foreach ($e in $Extra) { Set-Content -LiteralPath (Join-Path $src $e) -Value '# added in this release' }
-            if ($Tamper) { & $Tamper $src }
-            $pkg = New-ReleasePackage -Root $src -Version $Tag -Files ($script:RuntimeFiles + $Extra) -OutDir (Join-Path $src 'out')
-            $global:ArSyncFakeDir = Join-Path $src 'out'
-            $global:ArSyncFakeTag = $Tag
-            $global:ArSyncFakeAssets = @("ar-sync-$Tag.zip", "ar-sync-$Tag.zip.sha256")
-            return $pkg
-        }
-    }
 
     BeforeEach {
         Initialize-Mocks
@@ -967,6 +979,57 @@ Describe 'Self-update' {
             Should -Invoke Invoke-UpdateApi -ModuleName AroniumSync -Times 0 -Exactly
         } finally { [void]$done.Set(); [void]$ps.EndInvoke($h); $ps.Dispose() }
         Invoke-SelfUpdate -Config $I.Cfg -AppDir $I.App -MutexWaitSeconds 1 | Should -Be 'updated'
+    }
+}
+
+Describe 'Self-update with spaces and 8.3 short names in the user folder' {
+    # Shop laptops: C:\Users\M.O FLORES CONS -> C:\Users\M8F8E~1.OFL. Resolve-Path keeps the short
+    # form, Get-ChildItem returns long names, so cutting by string length put files in "age\".
+    BeforeEach {
+        Initialize-Mocks
+        $long = Join-Path $TestDrive ('M.O FLORES CONS ' + [guid]::NewGuid().ToString('N').Substring(0, 6))
+        New-Item -ItemType Directory -Force -Path (Join-Path $long 'stage\sub'), (Join-Path $long 'install') | Out-Null
+        Set-Content -LiteralPath (Join-Path $long 'stage\VERSION') -Value 'v9.9.9'
+        Set-Content -LiteralPath (Join-Path $long 'stage\sub\file.txt') -Value 'x'
+        $short = (New-Object -ComObject Scripting.FileSystemObject).GetFolder($long).ShortPath
+        $has83 = ($short -ne $long)
+    }
+
+    It 'the test machine makes 8.3 names (otherwise the tests below cannot reproduce the bug)' {
+        if (-not $has83) { Set-ItResult -Skipped -Because '8.3 names are off on this volume' }
+        $short | Should -Match '~'
+    }
+
+    It 'Get-RelativeFilePath gives the right path when the root is in short form and the file in long form' {
+        Get-RelativeFilePath -Root (Join-Path $short 'stage') -Path (Join-Path $long 'stage\sub\file.txt') | Should -Be 'sub\file.txt'
+        Get-RelativeFilePath -Root (Join-Path $long 'stage') -Path (Join-Path $short 'stage\VERSION') | Should -Be 'VERSION'
+        { Get-RelativeFilePath -Root (Join-Path $long 'stage') -Path (Join-Path $long 'install\x') } | Should -Throw '*not under*'
+    }
+
+    It 'copies a package staged under a short-name path into the install folder, not a stray subfolder' {
+        $install = Join-Path $long 'install'
+        $bk = Join-Path $long 'bk'
+        New-Item -ItemType Directory -Force -Path $bk | Out-Null
+        Copy-PackageIntoInstall -Stage (Join-Path $short 'stage') -AppDir $install -BackupDir $bk
+        Test-Path -LiteralPath (Join-Path $install 'VERSION') | Should -BeTrue
+        Test-Path -LiteralPath (Join-Path $install 'sub\file.txt') | Should -BeTrue
+        @(Get-ChildItem -LiteralPath $install -Recurse -File).Count | Should -Be 2
+    }
+
+    It 'a full update succeeds when TEMP and the install folder are under a short-name user folder' {
+        $I = New-FakeInstall -Root (Join-Path $long 'Users')
+        Set-FakeGitHub
+        $before = Get-ChildItem -LiteralPath $I.App -Directory | ForEach-Object { $_.Name }
+        New-FakeRelease -Tag 'v1.1.0' | Out-Null
+        $tempShort = (New-Object -ComObject Scripting.FileSystemObject).GetFolder($long).ShortPath
+        $oldTemp = $env:TEMP
+        try {
+            $env:TEMP = $tempShort
+            Invoke-SelfUpdate -Config $I.Cfg -AppDir $I.App | Should -Be 'updated'
+        } finally { $env:TEMP = $oldTemp }
+        Get-InstalledVersion -AppDir $I.App | Should -Be 'v1.1.0'
+        $after = Get-ChildItem -LiteralPath $I.App -Directory | ForEach-Object { $_.Name }
+        @($after | Where-Object { $before -notcontains $_ -and $_ -ne 'update-backup' }) | Should -BeNullOrEmpty
     }
 }
 

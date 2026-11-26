@@ -1394,12 +1394,54 @@ function Test-ModuleImport {
     return $line[0].Substring(5)
 }
 
+function Get-NormalPath {
+    # Full, long-form path without a trailing slash. .NET Framework's GetFullPath also expands
+    # 8.3 short names (C:\Users\M8F8E~1.OFL -> C:\Users\M.O FLORES CONS) for parts that exist.
+    param([Parameter(Mandatory)][string]$Path)
+    $full = [IO.Path]::GetFullPath($Path)
+    if ($full.Length -gt 3) { $full = $full.TrimEnd('\') }
+    return $full
+}
+
+function Get-RelativeFilePath {
+    # Path of File relative to Root, whichever of them is in short (8.3) or long form.
+    param([Parameter(Mandatory)][string]$Root, [Parameter(Mandatory)][string]$Path)
+    $r = Get-NormalPath $Root
+    $p = Get-NormalPath $Path
+    $prefix = $r.TrimEnd('\') + '\'
+    if (-not $p.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { throw "'$Path' is not under '$Root'" }
+    return $p.Substring($prefix.Length)
+}
+
+function Get-TreeFiles {
+    # Every file under Root as @{ Rel; Full }. Relative paths are built from the entry names
+    # while walking the tree, so they never depend on how Root itself was spelled.
+    param([Parameter(Mandatory)][string]$Root)
+    $rootFull = Get-NormalPath $Root
+    $out = New-Object System.Collections.Generic.List[object]
+    $walk = {
+        param([string]$Dir, [string]$Rel)
+        foreach ($f in [IO.Directory]::GetFiles($Dir)) {
+            $name = [IO.Path]::GetFileName($f)
+            $r = $(if ($Rel) { Join-Path $Rel $name } else { $name })
+            $out.Add([pscustomobject]@{ Rel = $r; Full = (Join-Path $Dir $name) })
+        }
+        foreach ($d in [IO.Directory]::GetDirectories($Dir)) {
+            $name = [IO.Path]::GetFileName($d)
+            & $walk (Join-Path $Dir $name) $(if ($Rel) { Join-Path $Rel $name } else { $name })
+        }
+    }
+    & $walk $rootFull ''
+    return $out.ToArray()
+}
+
 function Test-UpdatePackage {
     # Checks an unpacked release before it goes anywhere near the install folder.
     param([Parameter(Mandatory)][string]$Dir, [Parameter(Mandatory)][string]$ExpectedVersion, [string]$ConfigPath, [string]$AppDir)
-    $root = (Resolve-Path -LiteralPath $Dir).ProviderPath.TrimEnd('\')
-    $files = @(Get-ChildItem -LiteralPath $root -Recurse -File)
-    Assert-ReleaseFiles -Paths @($files | ForEach-Object { $_.FullName.Substring($root.Length + 1) })
+    $root = Get-NormalPath $Dir
+    $tree = @(Get-TreeFiles -Root $root)
+    Assert-ReleaseFiles -Paths @($tree | ForEach-Object { $_.Rel })
+    $files = @($tree | ForEach-Object { Get-Item -LiteralPath $_.Full })
     foreach ($f in $script:ReleaseRequired) {
         if (-not (Test-Path -LiteralPath (Join-Path $root $f))) { throw "Package is missing $f" }
     }
@@ -1416,11 +1458,12 @@ function Copy-PackageIntoInstall {
     # Copies every package file into AppDir. Before overwriting, saves the old file in BackupDir;
     # files that did not exist yet are listed in BackupDir\added.txt so a rollback can remove them.
     param([Parameter(Mandatory)][string]$Stage, [Parameter(Mandatory)][string]$AppDir, [Parameter(Mandatory)][string]$BackupDir)
-    $root = (Resolve-Path -LiteralPath $Stage).ProviderPath.TrimEnd('\')
+    $AppDir = Get-NormalPath $AppDir
+    $BackupDir = Get-NormalPath $BackupDir
     $added = New-Object System.Collections.Generic.List[string]
     $addedPath = Join-Path $BackupDir 'added.txt'
-    foreach ($f in @(Get-ChildItem -LiteralPath $root -Recurse -File)) {
-        $rel = $f.FullName.Substring($root.Length + 1)
+    foreach ($f in @(Get-TreeFiles -Root $Stage)) {
+        $rel = $f.Rel
         $dest = Join-Path $AppDir $rel
         $destDir = Split-Path -Parent $dest
         if (-not (Test-Path -LiteralPath $destDir)) { New-Item -ItemType Directory -Force -Path $destDir | Out-Null }
@@ -1433,18 +1476,18 @@ function Copy-PackageIntoInstall {
             $added.Add($rel)
             [IO.File]::WriteAllLines($addedPath, $added.ToArray())
         }
-        Copy-Item -LiteralPath $f.FullName -Destination $dest -Force
+        Copy-Item -LiteralPath $f.Full -Destination $dest -Force
         Unblock-File -LiteralPath $dest -ErrorAction SilentlyContinue
     }
 }
 
 function Restore-InstallFromBackup {
     param([Parameter(Mandatory)][string]$AppDir, [Parameter(Mandatory)][string]$BackupDir)
-    $files = Join-Path $BackupDir 'files'
+    $AppDir = Get-NormalPath $AppDir
+    $files = Join-Path (Get-NormalPath $BackupDir) 'files'
     if (Test-Path -LiteralPath $files) {
-        $root = (Resolve-Path -LiteralPath $files).ProviderPath.TrimEnd('\')
-        foreach ($f in @(Get-ChildItem -LiteralPath $root -Recurse -File)) {
-            Copy-Item -LiteralPath $f.FullName -Destination (Join-Path $AppDir $f.FullName.Substring($root.Length + 1)) -Force
+        foreach ($f in @(Get-TreeFiles -Root $files)) {
+            Copy-Item -LiteralPath $f.Full -Destination (Join-Path $AppDir $f.Rel) -Force
         }
     }
     $addedPath = Join-Path $BackupDir 'added.txt'
@@ -1481,6 +1524,7 @@ function Invoke-SelfUpdate {
         [int]$MutexWaitSeconds = 60
     )
     if (-not $AppDir) { $AppDir = Split-Path -Parent $Config.configPath }
+    $AppDir = Get-NormalPath $AppDir   # long form: user folders with spaces get 8.3 short names
     if ($Version -and $Version -notmatch $script:VersionPattern) {
         Write-SyncLog -Config $Config -Level ERROR -Message "Update: '$Version' is not a version like v1.2.3."
         return 'failed'
@@ -1526,7 +1570,7 @@ function Invoke-SelfUpdate {
             if (-not (Test-UpdateUrl ([string]$a.browser_download_url))) { throw "refusing download from $($a.browser_download_url)" }
         }
 
-        $work = Join-Path $env:TEMP ('ar-sync-update-' + [guid]::NewGuid().ToString('N'))
+        $work = Join-Path (Get-NormalPath $env:TEMP) ('ar-sync-update-' + [guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Force -Path $work | Out-Null
         $zip = Join-Path $work $zipName
         $shaFile = $zip + '.sha256'
