@@ -1,7 +1,41 @@
 # On-site test: one half-day visit
 
 **A** = selling laptop. **B** = viewing laptop. Each step says which one: **[A]**, **[B]** or **[A+B]**.
-Hostnames: A = `__________`  B = `__________` (from `$env:COMPUTERNAME`).
+Hostnames: A = `LAPTOP-MB7LH62P`  B = `LAPTOP-MVEPIKMR` (from `$env:COMPUTERNAME`).
+
+## Remote setup, 2026-11-26 (done over MeshCentral)
+
+Both laptops are already installed (v1.0.0) and running. On the visit, skip what is ticked here and do the rest.
+
+| | A (seller) | B (reader) |
+|---|---|---|
+| Windows user | `M.O FLORES CONS` | `Marissa Flores` |
+| OneDrive (same personal account) | `C:\Users\M.O FLORES CONS\OneDrive` | `C:\Users\Marissa Flores\Desktop\OneDrive` |
+| Aronium | 1.44.0.1 → 1.52.2.0 | 1.50.1.3 → 1.52.2.0 |
+| Process / exe | `Aronium.Pos`, `C:\Program Files\Aronium\Aronium.Pos.exe` | same |
+| Backups before any change | `C:\ar-sync-backup\pos-*.db` (hash-checked) | same |
+
+Verified remotely:
+- [x] Section 2: backups of both `pos.db`, SHA256 match, `integrity_check` ok. They stay on each laptop in `C:\ar-sync-backup` (admins + that user only).
+- [x] Section 3: exe, process name and DB path (table above). The process name was checked against the running Aronium on A.
+- [x] Sleep and hibernate off on AC, lid set to do nothing on AC and battery (both). Both were on battery when checked, so keep them plugged in.
+- [x] Section 5: install on both. Tasks `AroniumSync Publish` (A), `AroniumSync Check` (B) and `AroniumSync Update` (both) run as the logged-on user, Interactive. The `aronium-sync:` link is in each user's HKCU. Shop hours are 08:00–18:00 Mon–Sat in both configs. Owner contact is `09195079798`.
+- [x] Section 6: first publish on A. `latest.db` passes `integrity_check`, and OneDrive delivered it to B with the same SHA256 as `latest.json`. First restore on B with Aronium closed: done silently, B's per-PC tables unchanged (row hashes before and after), and B's newest sale is now A's (17:26:35, 29,516 sales).
+- [x] Section 4 (reader side): a second check, and a third with Aronium open on B, did not pause.
+
+Still needs someone on site:
+- [ ] Section 4 on A: does opening Aronium on A, with no sale, change the fingerprint?
+- [ ] Section 7: see each toast and click each button. Toasts were logged (`TOAST [install]` in `sync.log` on both), but nobody has seen one on screen.
+- [ ] Desktop shortcuts "Clear pause" and "Take over": check they exist and open.
+- [ ] Sections 8–9: takeover rehearsal and shutdown publish.
+- [ ] Printing on B after a restore (printer tables are per-PC and were kept, but test a receipt).
+- [ ] B has Aronium's **Price Lists** plugin and A does not. B re-adds the Price Lists tables each time it opens a restored copy. That's harmless unless staff start using price lists on B. Decide whether to remove the plugin from B or add it to A.
+- [ ] Both `C:\ar-sync-backup` folders can be deleted after a week of good syncs.
+
+Notes for remote work (MeshCentral):
+- `runcommand --runasuser` hangs and blocks the agent's command queue. To run as the user, register a one-shot scheduled task with an Interactive principal (`ustart.ps1` on the server does this).
+- `Start-Process -Wait` on the Aronium installer never returns, because setup starts Aronium as SYSTEM in session 0 at the end. Wait on the installer process only, then stop that session-0 Aronium. It opens an empty DB in the SYSTEM profile, not the shop's.
+- Staff don't need to run the agent installer again. Running it again starts a second, temporary agent.
 
 **Ground rules**
 - No real sales during the visit. Ideally the shop is closed. Then "put the step-2 copies back" is always a clean rollback.
