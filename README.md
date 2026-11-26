@@ -31,6 +31,9 @@ Do this on each laptop, signed in as the Windows user who uses Aronium. You don'
    - OneDrive folder: use the same one on both laptops. The default is `OneDrive\aronium`.
    - Who to call: a name and phone number. It appears in the warnings.
    - Shop hours: used for the "main laptop is down" warning.
+6. Install checks the name Aronium runs under, because sync uses it to tell whether Aronium is open.
+   - If install stops with "Aronium is running as ...", run it again and add `-AroniumProcessName <that name>`.
+   - If it warns that it couldn't check the name, open Aronium and run `Get-Process | Where-Object { $_.Path -like '*Aronium*' }`. If the name differs from the exe's file name, install again with `-AroniumProcessName`.
 
 Install the selling laptop first. You'll get an "Aronium Sync is set up" notification. The desktop gets an **Aronium Sync - Clear pause** icon, and the viewing laptop also gets **Aronium Sync - Take over**.
 
@@ -69,10 +72,25 @@ Before you change it, open Aronium on the old laptop and note any sales from its
 To make it the viewing laptop, run on it:
 
 ```
-powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\AroniumSync\uninstall.ps1"
+powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\AroniumSync\set-role.ps1" -Role reader
 ```
 
-Then install it again with `-Role reader`.
+Within 5 minutes it loads the new selling laptop's copy. Its old file is kept in `backups`.
+
+## Give the selling role back
+
+After a takeover, the repaired laptop has old data. **Don't reinstall it as the selling laptop.** It would publish its old copy, lose the sales made on the other laptop since the takeover, and set receipt numbers back so they repeat later. Install and `set-role.ps1` refuse to do this without `-Force`.
+
+Do it in this order:
+
+1. On the laptop that is selling now, close Aronium and wait for its next copy (up to 15 minutes).
+2. On the repaired laptop, make it the viewing laptop:
+   ```
+   powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\AroniumSync\set-role.ps1" -Role reader
+   ```
+3. Wait up to 5 minutes, then open Aronium on it and check the latest sales are there. Close Aronium.
+4. On the repaired laptop, double-click **Aronium Sync - Take over** and click **Yes**. Receipt numbers jump by another 500. That's expected.
+5. On the other laptop, the "no longer the selling laptop" notification appears. Make it the viewing laptop with the command in step 2.
 
 ## Clearing a sync pause
 
@@ -98,7 +116,11 @@ If more sales are made on the viewing laptop after you clear the pause, it pause
   - print stations
   - the Aronium app ID
   - security keys
-- **Uninstall:** run `uninstall.ps1` from `%LOCALAPPDATA%\AroniumSync`. It removes everything except the `backups` folder and the copies in OneDrive.
+- **Switch roles:** run `set-role.ps1 -Role reader` or `-Role seller` from `%LOCALAPPDATA%\AroniumSync`. It needs no internet. To give the selling role back after a takeover, follow [Give the selling role back](#give-the-selling-role-back).
+- **Uninstall:** run `uninstall.ps1` from `%LOCALAPPDATA%\AroniumSync`. It removes everything except:
+  - the `backups` folder
+  - the copies in OneDrive
+  - `sqlite3.exe` and the BurntToast module, so a reinstall works offline. Add `-Purge` to remove these two as well.
 - **Rehearse a takeover once** before you rely on it. See `VERIFY.md` for the checks that can only be done on the real laptops.
 
 ## For developers
@@ -109,4 +131,4 @@ If more sales are made on the viewing laptop after you clear the pause, it pause
 - If `fixtures\real.db` exists, every database test also runs on a copy of it. It's gitignored: put a copy of a real backup there yourself and never commit it.
 - Layout:
   - All logic is in `AroniumSync.psm1`.
-  - `publish.ps1`, `check.ps1`, `takeover.ps1`, `update-now.ps1`, `protocol-handler.ps1` and `clear-pause.ps1` are thin wrappers.
+  - `publish.ps1`, `check.ps1`, `takeover.ps1`, `update-now.ps1`, `protocol-handler.ps1`, `clear-pause.ps1` and `set-role.ps1` are thin wrappers.

@@ -74,24 +74,28 @@ Path on A: `________` Path on B: `________`. If it isn't the default, set `$DB` 
 ```powershell
 Get-Process | Where-Object { $_.Path -like '*Aronium*' } | Select-Object ProcessName, Path, SessionId
 ```
-Expect: one row. Write down Path (exe) `________` and ProcessName `________`. **ProcessName must equal the exe file name without `.exe`.**
-- Install takes the process name from the exe name.
-- If the name is wrong, the "Aronium is running" guard is blind, and a restore could swap `pos.db` under a running Aronium.
+Expect: one row. Write down Path (exe) `________` and ProcessName `________`.
+Pass both to install as `-AroniumExe` and `-AroniumProcessName`. Sync also spots Aronium by its exe path, but the name is the main check. `[ ] pass [ ] fail`
 
-If fail: after install, fix it with `Edit-Cfg { param($c) $c.aroniumProcessName = 'RealName' }` and re-check. `[ ] pass [ ] fail`
+**3.3 [A+B]** With Aronium still open, run:
+```powershell
+try { [IO.File]::Open($DB, 'Open', 'ReadWrite', 'None').Dispose(); 'free' } catch { 'held' }
+```
+Expect: `held`. Aronium keeps `pos.db` open, so the restore guard can see Aronium even without the process name.
+If it prints `free`, the guard relies on the process name and exe path only. Note it, and don't fail the visit for it. `[ ] pass [ ] fail`
 
-**3.3 [A+B]** Close Aronium, then run `Get-ChildItem "$DB*"`.
+**3.4 [A+B]** Close Aronium, then run `Get-ChildItem "$DB*"`.
 Expect: only `pos.db`, with no `-journal` or `-wal`.
 If fail: a leftover journal after a clean close means every restore will be refused. Stop and report. `[ ] pass [ ] fail`
 
-**3.4 [A+B]** Check OneDrive:
+**3.5 [A+B]** Check OneDrive:
 1. On A, run `Set-Content "$env:OneDrive\probe.txt" (Get-Date)`.
 2. On B, run `Get-Content "$env:OneDrive\probe.txt"`.
 
 Expect: B shows the same text within 2 minutes. Delete the file afterward.
 If fail: compare the account in OneDrive settings on both laptops and fix it before going on. `[ ] pass [ ] fail`
 
-**3.5** Don't hand-edit `config.example.json`, because it isn't valid JSON (see Issues). Pass the values from 3.1 and 3.2 to `install.ps1` as parameters instead. `[ ] pass [ ] fail`
+**3.6** Pass the values from 3.1 and 3.2 to `install.ps1` as parameters instead of editing `config.example.json` by hand. `[ ] pass [ ] fail`
 
 ## 4. Fingerprint check: does opening Aronium look like a sale?
 
@@ -127,17 +131,19 @@ New-Item -ItemType Directory -Force "$S\bin" | Out-Null; Copy-Item $SQ "$S\bin\"
 ```
 `[ ] pass [ ] fail`
 
-**5.2 [A]** Close Aronium, then run:
+**5.2 [A]** Leave Aronium **open** so install can check the process name, then run:
 ```powershell
 cd $U
-powershell -ExecutionPolicy Bypass -File .\install.ps1 -Role seller -DbPath "$DB" -AroniumExe "<exe from 3.2>" -OneDriveFolder "$env:OneDrive\aronium" -OwnerContact "<name, phone>" -ShopOpen 08:00 -ShopClose 21:00
+powershell -ExecutionPolicy Bypass -File .\install.ps1 -Role seller -DbPath "$DB" -AroniumExe "<exe from 3.2>" -AroniumProcessName "<name from 3.2>" -OneDriveFolder "$env:OneDrive\aronium" -OwnerContact "<name, phone>" -ShopOpen 08:00 -ShopClose 21:00
 ```
 Expect:
+- `process name OK`
 - `Running a first publish ...` followed by `published`
 - an "Aronium Sync is set up. This laptop is the selling laptop." toast
 - a **Clear pause** icon on the desktop
 
 If fail:
+- "Aronium is running as ...": rerun with that `-AroniumProcessName`.
 - BurntToast error: see 1.2.
 - sqlite hash error: see 5.1.
 
@@ -146,13 +152,13 @@ If fail:
 **5.3 [A]** Check the setup:
 ```powershell
 Get-Content "$S\config.json"; Get-Content "$OD\writer.json"; Get-Content "$OD\latest.json"
-(Get-ScheduledTask 'AroniumSync Publish').Triggers | Select-Object -ExpandProperty CimClass
+(Get-ScheduledTask 'AroniumSync Publish').Triggers | Select-Object @{n='Type';e={$_.CimClass.CimClassName}}, Delay
 Start-ScheduledTask 'AroniumSync Publish'; Start-Sleep 30; Get-ScheduledTaskInfo 'AroniumSync Publish' | Select-Object LastRunTime, LastTaskResult
 ```
 Expect:
 - `aroniumProcessName` equals the name from 3.2.
 - writer and latest both show host A.
-- The triggers include `MSFT_TaskEventTrigger` (shutdown).
+- The triggers include `MSFT_TaskEventTrigger` (shutdown), and the logon trigger has a `PT3M` delay.
 - `LastTaskResult` is `0`.
 - No PowerShell window flashes up.
 
@@ -173,6 +179,7 @@ If fail:
 (Get-FileHash "$OD\latest.db").Hash.ToLower() -eq (Get-Content "$OD\latest.json" | ConvertFrom-Json).sha256
 ```
 Expect:
+- a warning that install couldn't check the process name, because Aronium is closed. That's fine, since 3.2 checked it.
 - `Running a first check ...` followed by `restored`
 - the setup toast
 - **Clear pause** and **Take over** icons on the desktop
@@ -311,34 +318,37 @@ Expect:
 
 **8.4 [B]** Ring up test sale #3. Expect: the receipt number is 500 above A's next number, and it prints on B's printer. Refund it on B. `[ ] pass [ ] fail`
 
-**8.5 [A]** Turn A on and sign in. Within 2 minutes, run:
+**8.5 [A]** Turn A on and sign in. The publish task waits 3 minutes after sign-in so OneDrive can catch up. After 5 minutes, run:
 ```powershell
 Select-String 'Published|Not publishing' "$S\sync.log" | Select-Object -Last 4
 Get-Content "$OD\latest.json"; Get-ChildItem $OD
 ```
 Expect:
 - a persistent "This laptop is no longer the selling laptop. Do not sell on it." toast
-- the **first** line after boot is `Not publishing: writer is now B`
+- the **first** line after boot is `Not publishing: writer is now B` or `Not publishing: latest.json is from B`
 - latest.json still shows host B
 - no `latest-<PC>` conflict copies
 
-If fail: a `Published` line at boot is the boot race (Issue 2). B's next publish fixes `latest.db`. Note it and carry on. `[ ] pass [ ] fail`
+If fail: a `Published` line at boot means A overwrote B's copy. That is a bug, so report it. B's next publish fixes `latest.db`. `[ ] pass [ ] fail`
 
-**Hand back.** Never reinstall A straight as seller. It would publish A's out-of-date database, drop B's sales and roll the counters back, which means duplicate receipt numbers later. Move B's data to A first.
+**Hand back.** This follows README "Give the selling role back". Never make A the seller straight away. It would publish A's out-of-date database, drop B's sales and roll the counters back, which means duplicate receipt numbers later. Move B's data to A first.
 
-**8.6 [B]** Start the Publish task. **[A]** Run:
+**8.6 [A]** Check the guard: `powershell -ExecutionPolicy Bypass -File "$S\set-role.ps1" -Role seller`.
+Expect: it refuses, naming B and pointing to "Give the selling role back". Nothing changes. `[ ] pass [ ] fail`
+
+**8.7 [B]** Start the Publish task. **[A]** Run:
 ```powershell
-powershell -ExecutionPolicy Bypass -File "$S\uninstall.ps1" -KeepBurntToast
-New-Item -ItemType Directory -Force "$S\bin" | Out-Null; Copy-Item $SQ "$S\bin\"
-cd $U; powershell -ExecutionPolicy Bypass -File .\install.ps1 -Role reader -DbPath "$DB" -AroniumExe "<exe>" -OneDriveFolder "$env:OneDrive\aronium" -OwnerContact "<name, phone>" -ShopOpen 08:00 -ShopClose 21:00
+powershell -ExecutionPolicy Bypass -File "$S\set-role.ps1" -Role reader
+Start-ScheduledTask 'AroniumSync Check'
 ```
-Expect: `restored`. Open Aronium on A: test sale #3 and its refund are there. Close Aronium. `[ ] pass [ ] fail`
+Expect: `restored` in the log. Open Aronium on A: test sale #3 and its refund are there. Close Aronium. `[ ] pass [ ] fail`
 
-**8.7 [A]** Double-click **Take over**, then click **Yes**.
+**8.8 [A]** Double-click **Take over**, then click **Yes**.
 Expect: the Counter values are `counter-0` + 1000 (two jumps, which is expected), and writer.json shows host A. `[ ] pass [ ] fail`
 
-**8.8 [B]** Start the Publish task.
-Expect: the "no longer the selling laptop" toast and `Not publishing: writer is now A`. Then run uninstall with `-KeepBurntToast`, copy sqlite in, and install with `-Role reader`, as in 8.6.
+**8.9 [B]** Start the Publish task.
+Expect: the "no longer the selling laptop" toast and `Not publishing: writer is now A`.
+Then run `set-role.ps1 -Role reader` as in 8.7 and start the Check task.
 Expect: `restored`, and B's counters match A's. `[ ] pass [ ] fail`
 
 ## 9. Shutdown publish
@@ -360,7 +370,7 @@ Roll back if:
 - B's printer settings are lost
 
 **10.1 [A, B or both]** Uninstall: `powershell -ExecutionPolicy Bypass -File "$S\uninstall.ps1"`.
-This removes the tasks, the link, the icons, the scripts and the config. It keeps `$S\backups` and the OneDrive folder. `[ ] pass [ ] fail`
+This removes the tasks, the link, the icons, the scripts and the config. It keeps `$S\backups`, the OneDrive folder, `sqlite3.exe` and BurntToast. Add `-Purge` to remove the last two as well. `[ ] pass [ ] fail`
 
 **10.2 [same laptop]** Close Aronium. Put the section-2 copy back:
 ```powershell
@@ -400,21 +410,23 @@ If only B is the problem, uninstall B alone. A keeps making OneDrive copies, whi
 
 `[ ] pass [ ] fail`
 
-## Issues found (code not changed)
+## Issues found on first read (now fixed)
 
-1. **`config.example.json` is not valid JSON.**
-   - The paths contain `\a`, `\A` and `\D`, which aren't valid JSON escapes. Both PowerShell 5.1 and 7 throw on `ConvertFrom-Json`.
-   - `install.ps1` doesn't use the file, so installs aren't affected. Anyone who copies it by hand gets a config that won't load.
-   - Fix: double the backslashes.
-2. **Boot race after a takeover.**
-   - The old seller's logon trigger runs `publish.ps1` straight away. If OneDrive hasn't downloaded the new `writer.json` yet, it still sees itself as the writer and publishes its out-of-date database over `latest.db` once.
-   - This can also leave a history entry and OneDrive conflict copies.
-   - The new seller's next publish (within 15 minutes) fixes `latest.db`. Step 8.5 checks for this.
-3. **Restore safety depends on an unchecked process name.**
-   - `Invoke-Restore` refuses to run only if `Get-AroniumProcess` finds `aroniumProcessName`.
-   - Install sets that name from the exe file name, with no parameter and no check. If it's wrong, a restore can run with Aronium open.
-   - Steps 3.2 and 5.3 catch this on site.
-4. **The README has no hand-back steps.**
-   - The obvious move is to reinstall the old laptop as seller. That publishes its out-of-date database, drops the other laptop's sales and rolls `Counter` back, which leads to duplicate receipt numbers.
-   - Section 8 uses the safe path: reader, then restore, then Take over.
-5. **Every role change needs internet.** `uninstall.ps1` removes BurntToast (unless you pass `-KeepBurntToast`) and `bin\sqlite3.exe`, so each role change downloads both again. Steps 5.1 and 8.6 work around this.
+The five issues from the first version of this script are fixed in code and covered by tests:
+
+1. `config.example.json` is now valid JSON.
+2. **Boot race:**
+   - The old seller also refuses to publish when `latest.json` comes from another laptop and is newer than its own last publish.
+   - The seller's logon task waits 3 minutes.
+   - Step 8.5 checks this.
+3. **Process name:**
+   - Install takes `-AroniumProcessName` and checks it against the running Aronium.
+   - Restores also refuse when Aronium's exe or `pos.db` is held open, or the process list can't be read.
+   - Steps 3.3 and 5.2 check this.
+4. **Hand-back:**
+   - The README has a "Give the selling role back" section.
+   - Install and `set-role.ps1 -Role seller` refuse to overwrite newer data from the other laptop unless you pass `-Force`.
+   - Steps 8.6 to 8.9 check this.
+5. **Role changes work offline:**
+   - `set-role.ps1` switches roles in place.
+   - `uninstall.ps1` keeps `sqlite3.exe` and BurntToast unless you pass `-Purge`.
