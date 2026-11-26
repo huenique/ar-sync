@@ -258,6 +258,16 @@ Describe 'Divergence check (<Kind> DB)' -ForEach $Cases {
         Invoke-Check -Config $B -Now $Now.AddMinutes(10) | Should -Be 'paused'
     }
 
+    It 'clearing the flag restores even when no newer copy has been published since' {
+        Invoke-Check -Config $B -Now $Now | Should -Be 'restored'
+        Add-TestSale -Database $B.dbPath -When '2026-11-26 10:02:00'
+        Invoke-Check -Config $B -Now $Now.AddMinutes(5) | Should -Be 'paused'
+        Remove-Item -LiteralPath $B.pauseFlag
+        Invoke-Check -Config $B -Now $Now.AddMinutes(10) | Should -Be 'restored'
+        Get-DataFingerprint -Config $B -Database $B.dbPath | Should -Be (Get-DataFingerprint -Config $A -Database $A.dbPath)
+        Invoke-Check -Config $B -Now $Now.AddMinutes(15) | Should -Be 'up-to-date'
+    }
+
     It 'with no restore stamp, a local DB that differs from the published copy pauses' {
         Remove-Item -LiteralPath (Join-Path $B.stateDir 'restore-stamp.json')
         Invoke-Check -Config $B -Now $Now | Should -Be 'paused'
@@ -314,6 +324,16 @@ Describe 'Stale main laptop' {
         }
         Invoke-Check -Config $B -Now $Now.AddMinutes(5) | Out-Null
         Should -Invoke Show-SyncToast -ModuleName AroniumSync -Times 1 -Exactly -ParameterFilter { $Kind -eq 'stale' }
+    }
+
+    It 'does not raise the alarm at opening just because the seller is not on yet' {
+        Invoke-Publish -Config $A -Now ([datetime]'2026-11-25T20:00:00') -HostName 'LAPTOP-A' | Out-Null
+        Invoke-Check -Config $B -Now ([datetime]'2026-11-26T08:30:00') | Out-Null
+        Should -Invoke Show-SyncToast -ModuleName AroniumSync -Times 0 -Exactly -ParameterFilter { $Kind -eq 'stale' }
+        Invoke-Check -Config $B -Now ([datetime]'2026-11-26T09:05:00') | Out-Null
+        Should -Invoke Show-SyncToast -ModuleName AroniumSync -Times 1 -Exactly -ParameterFilter {
+            $Kind -eq 'stale' -and $Text -eq "Main laptop last synced at Wed 20:00. If it's down, use Take over."
+        }
     }
 
     It 'does not toast outside shop hours' {
@@ -421,6 +441,16 @@ Describe 'Take over (<Kind> DB)' -ForEach $Cases {
         Should -Invoke Show-SyncToast -ModuleName AroniumSync -Times 1 -Exactly -ParameterFilter {
             $Kind -eq 'not-writer' -and $Text -like 'This laptop is no longer the selling laptop*'
         }
+    }
+
+    It 'running Take over again on the laptop that is already the seller does nothing' {
+        Mock Show-ConfirmBox -ModuleName AroniumSync { $true }
+        Invoke-Takeover -Config $B -Now $Now -HostName 'LAPTOP-B' | Should -Be 'taken-over'
+        $countersAfterFirst = Get-Counters $B.dbPath
+        Invoke-Takeover -Config $B -Now $Now.AddMinutes(1) -HostName 'LAPTOP-B' | Should -Be 'already-seller'
+        $again = Get-Counters $B.dbPath
+        foreach ($k in $countersAfterFirst.Keys) { $again[$k] | Should -Be $countersAfterFirst[$k] }
+        Should -Invoke Show-ConfirmBox -ModuleName AroniumSync -Times 1 -Exactly
     }
 
     It 'does nothing if Aronium will not close' {

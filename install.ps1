@@ -10,7 +10,7 @@
 #   4. Writes config.json (asks for anything it cannot detect)
 #   5. Registers the aronium-sync: link used by toast buttons (HKCU only)
 #   6. Registers the scheduled task: publish every 15 min (seller) or check every 5 min (reader)
-#   7. Puts "Aronium Sync - Take over" and "Aronium Sync - Clear pause" on the desktop
+#   7. Puts "Aronium Sync - Clear pause" (and on the reader "Aronium Sync - Take over") on the desktop
 param(
     [Parameter(Mandatory)][ValidateSet('seller', 'reader')][string]$Role,
     [string]$OneDriveFolder,
@@ -122,7 +122,7 @@ if (Test-Path -LiteralPath $cfgPath) {
 # shared folder; keep it downloaded on this PC (not an online-only placeholder)
 $share = Get-SharePaths -Config $cfg
 New-Item -ItemType Directory -Force -Path $share.Dir, $share.History | Out-Null
-& attrib.exe +P -U "$($share.Dir)" /S /D 2>$null | Out-Null
+try { & attrib.exe +P -U "$($share.Dir)" /S /D 2>&1 | Out-Null } catch { Write-Warning 'Could not pin the OneDrive folder; set "Always keep on this device" by hand.' }
 
 if ($Role -eq 'seller') {
     $w = Read-JsonFile $share.WriterJson
@@ -143,7 +143,9 @@ Register-SyncTasks -Config $cfg -Role $Role
 # 7. desktop shortcuts
 $desk = [Environment]::GetFolderPath('Desktop')
 $wsh = New-Object -ComObject WScript.Shell
-foreach ($s in @(@{ Name = 'Aronium Sync - Take over'; Script = 'takeover.ps1' }, @{ Name = 'Aronium Sync - Clear pause'; Script = 'clear-pause.ps1' })) {
+$shortcuts = @(@{ Name = 'Aronium Sync - Clear pause'; Script = 'clear-pause.ps1' })
+if ($Role -eq 'reader') { $shortcuts += @{ Name = 'Aronium Sync - Take over'; Script = 'takeover.ps1' } }
+foreach ($s in $shortcuts) {
     $lnk = $wsh.CreateShortcut((Join-Path $desk ($s.Name + '.lnk')))
     $lnk.TargetPath = Get-PowerShellExe
     $lnk.Arguments = '-NoProfile -ExecutionPolicy Bypass -File "{0}"' -f (Join-Path $app $s.Script)

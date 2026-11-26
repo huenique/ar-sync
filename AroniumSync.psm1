@@ -678,18 +678,25 @@ function Invoke-Check {
 
         $state = Get-SyncState -Config $Config
         $published = ConvertTo-SyncTime $latest.published_at
-        $ageMin = ([DateTimeOffset]$Now - $published).TotalMinutes
+        # Age counts from opening time at the earliest, so a seller that is simply not on yet
+        # at opening does not raise the alarm straight away.
+        $opened = [DateTimeOffset]($Now.Date + [TimeSpan]::Parse($Config.shopHours.open))
+        $since = if ($published -gt $opened) { $published } else { $opened }
+        $ageMin = ([DateTimeOffset]$Now - $since).TotalMinutes
         if ($ageMin -gt [double]$Config.staleMinutes -and (Test-ShopHours -Config $Config -Now $Now)) {
             if ($state.staleToastFor -ne [string]$latest.published_at) {
+                $local = $published.LocalDateTime
+                $when = if ($local.Date -eq $Now.Date) { $local.ToString('HH:mm') } else { $local.ToString('ddd HH:mm', [Globalization.CultureInfo]::InvariantCulture) }
                 Show-SyncToast -Config $Config -Kind 'stale' -Buttons @('takeover') `
-                    -Text ("Main laptop last synced at {0}. If it's down, use Take over." -f $published.LocalDateTime.ToString('HH:mm'))
+                    -Text ("Main laptop last synced at {0}. If it's down, use Take over." -f $when)
                 $state.staleToastFor = [string]$latest.published_at
                 Save-SyncState -Config $Config -State $state
             }
         }
 
+        # A person cleared a pause (ackFingerprint set): restore even if the sha has not changed.
         $stamp = Get-RestoreStamp -Config $Config
-        if ($stamp -and $stamp.sha256 -eq $latest.sha256) { return 'up-to-date' }
+        if ($stamp -and $stamp.sha256 -eq $latest.sha256 -and -not $state.ackFingerprint) { return 'up-to-date' }
 
         $incoming = Get-VerifiedIncoming -Config $Config -Latest $latest
         if (-not $incoming) {
@@ -776,6 +783,12 @@ function Invoke-Takeover {
         [datetime]$Now = (Get-Date),
         [string]$HostName = $env:COMPUTERNAME
     )
+    # Already the selling laptop: a second takeover would just skip 500 more receipt numbers.
+    $writerNow = Read-JsonFile (Get-SharePaths -Config $Config).WriterJson
+    if ($Config.role -eq 'seller' -and $writerNow -and $writerNow.host -eq $HostName) {
+        Show-SyncToast -Config $Config -Kind 'takeover' -Text 'This laptop is already the selling laptop. Nothing to do.'
+        return 'already-seller'
+    }
     # Never runs from one click: the confirm box comes first, with No as default.
     if (-not (Show-ConfirmBox -Text 'This makes THIS laptop the selling laptop. Receipt numbers jump by 500. Continue?')) {
         Write-SyncLog -Config $Config -Message 'Take over cancelled at the confirm box.'
@@ -805,7 +818,7 @@ function Invoke-Takeover {
             Write-SyncLog -Config $Config -Level WARN -Message 'Takeover: local data diverged; skipping restore and keeping local data.'
         } elseif ($latest -and $latest.sha256) {
             $stamp = Get-RestoreStamp -Config $Config
-            if (-not ($stamp -and $stamp.sha256 -eq $latest.sha256)) {
+            if ($acked -or -not ($stamp -and $stamp.sha256 -eq $latest.sha256)) {
                 $incoming = Get-VerifiedIncoming -Config $Config -Latest $latest
                 if ($incoming) { Invoke-Restore -Config $Config -IncomingPath $incoming -ExpectedSha $latest.sha256 -Latest $latest -Now $Now }
                 else {
@@ -907,7 +920,8 @@ function Get-SyncTaskXml {
         [Parameter(Mandatory)][ValidateSet('seller', 'reader')][string]$Role,
         [Parameter(Mandatory)][string]$ScriptPath,
         [Parameter(Mandatory)][string]$UserId,
-        [datetime]$Start = (Get-Date).Date
+        [datetime]$Start = (Get-Date).Date,
+        [switch]$NoEventTrigger
     )
     $esc = { param($s) [System.Security.SecurityElement]::Escape([string]$s) }
     $interval = if ($Role -eq 'seller') { 'PT15M' } else { 'PT5M' }
@@ -920,7 +934,7 @@ function Get-SyncTaskXml {
     </TimeTrigger>
     <LogonTrigger><Enabled>true</Enabled><UserId>$(& $esc $UserId)</UserId></LogonTrigger>
 "@
-    if ($Role -eq 'seller') {
+    if ($Role -eq 'seller' -and -not $NoEventTrigger) {
         $query = '<QueryList><Query Id="0" Path="System"><Select Path="System">*[System[Provider[@Name=''User32''] and EventID=1074]]</Select></Query></QueryList>'
         $triggers += @"
 
@@ -970,7 +984,15 @@ function Register-SyncTasks {
     $other = if ($Role -eq 'seller') { 'reader' } else { 'seller' }
     Unregister-ScheduledTask -TaskName $script:TaskNames[$other] -Confirm:$false -ErrorAction SilentlyContinue
     $xml = Get-SyncTaskXml -Role $Role -ScriptPath $script -UserId $user
-    Register-ScheduledTask -TaskName $script:TaskNames[$Role] -Xml $xml -Force | Out-Null
+    try {
+        Register-ScheduledTask -TaskName $script:TaskNames[$Role] -Xml $xml -Force -ErrorAction Stop | Out-Null
+    } catch {
+        if ($Role -ne 'seller') { throw }
+        # The shutdown (event 1074) trigger is a nice-to-have; register without it if Windows refuses.
+        Write-SyncLog -Config $Config -Level WARN -Message ('Shutdown trigger refused (' + $_.Exception.Message + '); publishing every 15 min and at logon only.')
+        $xml = Get-SyncTaskXml -Role $Role -ScriptPath $script -UserId $user -NoEventTrigger
+        Register-ScheduledTask -TaskName $script:TaskNames[$Role] -Xml $xml -Force -ErrorAction Stop | Out-Null
+    }
 }
 
 function Unregister-SyncTasks {

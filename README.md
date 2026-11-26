@@ -32,7 +32,7 @@ Do this on each laptop, signed in as the Windows user who uses Aronium. You don'
    - Who to call: a name and phone number. It appears in the warnings.
    - Shop hours: used for the "main laptop is down" warning.
 
-Install the selling laptop first. You'll get a "Aronium Sync is set up" notification. Two icons are added to the desktop: **Aronium Sync - Take over** and **Aronium Sync - Clear pause**.
+Install the selling laptop first. You'll get an "Aronium Sync is set up" notification. The desktop gets an **Aronium Sync - Clear pause** icon, and the viewing laptop also gets **Aronium Sync - Take over**.
 
 Everything lives in `%LOCALAPPDATA%\AroniumSync`. The log is `sync.log` in that folder.
 
@@ -43,7 +43,7 @@ Everything lives in `%LOCALAPPDATA%\AroniumSync`. The log is `sync.log` in that 
 | **New data from the main laptop (as of 14:30). Restart Aronium to see it.** | Viewing | Click **Update now**. Aronium closes, loads the new data and opens again. If you're busy, click **Later** and it will ask again when the next copy arrives. If Aronium is already closed, the update happens on its own with no notification. |
 | **Please close Aronium, then click Update now again.** | Viewing | Aronium didn't close by itself, maybe because a window or dialog is open. Finish what you're doing, close Aronium, then try again. Sync never forces Aronium closed. |
 | **Sales were recorded on this laptop. Sync is paused so they aren't lost. Call [owner].** | Viewing | Someone used the viewing laptop to sell or change something. Sync has stopped. See [Clearing a sync pause](#clearing-a-sync-pause). |
-| **Main laptop last synced at 10:15. If it's down, use Take over.** | Viewing | The selling laptop hasn't saved a copy for over an hour during shop hours. Check it's on, awake and connected to the internet. If it's broken, see [Take over](#take-over-the-selling-laptop-is-down). |
+| **Main laptop last synced at 10:15. If it's down, use Take over.** | Viewing | The selling laptop hasn't saved a copy for over an hour during shop hours. The hour counts from opening time, so a selling laptop that is switched on a little late doesn't trigger it. If the last copy is from an earlier day, the day is shown too (for example "Wed 20:00"). Check it's on, awake and connected to the internet. If it's broken, see [Take over](#take-over-the-selling-laptop-is-down). |
 | **Backup failed at 14:30: (reason)** | Selling | The copy didn't save. Common causes are OneDrive not running or signed out, a full disk, or a damaged database. It retries every 15 minutes. If it keeps failing, call the owner. |
 | **This laptop is no longer the selling laptop. Do not sell on it.** | Old selling laptop | The other laptop has taken over. Stop selling here. Reinstall this laptop with `-Role reader` once it's sorted out. |
 
@@ -62,7 +62,11 @@ Do this on the viewing laptop only when the selling laptop really can't be used:
    - It becomes the selling laptop and reopens Aronium.
 4. Sales made on the broken laptop after its last copy (up to 15 minutes' worth) aren't on this laptop. Re-enter them from the printed receipts if needed.
 
-When the old laptop is fixed, it won't publish over the new one. It shows "This laptop is no longer the selling laptop". To make it the viewing laptop, run on it:
+When the old laptop is fixed, it won't publish over the new one. It shows "This laptop is no longer the selling laptop".
+
+Before you change it, open Aronium on the old laptop and note any sales from its last 15 minutes that the new selling laptop doesn't have. Reinstalling it as the viewing laptop replaces its data; the old file is kept in its `backups` folder, but nothing warns you about those sales.
+
+To make it the viewing laptop, run on it:
 
 ```
 powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\AroniumSync\uninstall.ps1"
