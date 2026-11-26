@@ -33,6 +33,18 @@ reconnects by itself.
 To remove it later, run the same `.exe` and click **Uninstall**. Or use
 **Remove** in the device's General tab.
 
+### Let shop staff install it instead
+
+`docs/INSTALL-REMOTE-HELP.md` is a one-page guide for staff. Before you print it, fill in:
+
+- `<INVITE-LINK>`: open the **Shop** group, click **Invite**, choose
+  **Installation type: Background and interactive** and an expiry (e.g. 1 week),
+  then click **OK** and copy the link it shows. Staff open it, and it gives them the
+  Windows installer for the Shop group. They don't need to sign in.
+- `<HELP-CONTACT>`: the phone number or chat staff should use.
+
+Once a laptop shows up, run section 3 on it right away through Terminal.
+
 ## 3. Stop the laptops sleeping on AC power
 
 A sleeping laptop is offline. Run this in an admin PowerShell on each laptop.
