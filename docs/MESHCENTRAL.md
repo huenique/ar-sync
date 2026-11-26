@@ -8,24 +8,24 @@ It gives us remote desktop, a PowerShell terminal, and file access, at any time.
 - nginx site: `/etc/nginx/sites-available/meshcentral` (TLS by Let's Encrypt)
 - The app listens on `127.0.0.1:4430` only. nginx is the only way in.
 
-## 1. Create the "Shop" device group
+## 1. Create the "hardware store" device group
 
 1. Sign in at https://mesh.silongstrategies.com.
 2. On **My Devices**, click **Add Device Group** (or "Click here to create a device group").
-3. Name: `Shop`. Type: **Manage using a software agent**. Click **OK**.
+3. Name: `hardware store`. Type: **Manage using a software agent**. Click **OK**.
 
 ## 2. Install the agent on each laptop
 
 Do this on each laptop, signed in as a Windows admin.
 
-1. In MeshCentral, open the **Shop** group and click **Add Agent**.
+1. In MeshCentral, open the **hardware store** group and click **Add Agent**.
 2. Operating system: **Windows**. Installation type: **Background and interactive**.
    - "Background only" also works. It hides the tray icon, so the client can't see
      or stop it. Use it only if the client agrees (see the consent note below).
 3. Download **Windows (64-bit)**. You get one `.exe` with the server and group built in.
 4. Copy it to the laptop and run it as administrator. Click **Install**.
-5. Within a minute the laptop shows up in the Shop group. Rename it to something
-   clear, like `Shop - Counter 1`.
+5. Within a minute the laptop shows up in the hardware store group. Rename it to something
+   clear, like `Counter 1`.
 
 The agent runs as the Windows service **Mesh Agent**. It starts at boot and
 reconnects by itself.
@@ -37,13 +37,27 @@ To remove it later, run the same `.exe` and click **Uninstall**. Or use
 
 `docs/INSTALL-REMOTE-HELP.md` is a one-page guide for staff. Before you print it, fill in:
 
-- `<INVITE-LINK>`: open the **Shop** group, click **Invite**, choose
+- `<INVITE-LINK>`: open the **hardware store** group, click **Invite**, choose
   **Installation type: Background and interactive** and an expiry (e.g. 1 week),
   then click **OK** and copy the link it shows. Staff open it, and it gives them the
-  Windows installer for the Shop group. They don't need to sign in.
+  Windows installer for the hardware store group. They don't need to sign in.
 - `<HELP-CONTACT>`: the phone number or chat staff should use.
 
 Once a laptop shows up, run section 3 on it right away through Terminal.
+
+**Staff web page.** The same guide, with an "Install link" button, is at
+https://silongstrategies.com/staff/, behind nginx basic auth. It lives only on the
+server, in `/var/www/staff/index.html`, which is not in any git repo, so the invite
+link never lands in git.
+
+- Set or change the staff login: `ssh silong` then
+  `sudo htpasswd -c /etc/nginx/.htpasswd-staff staff`. With no login set, the page
+  refuses everyone.
+- Paste the invite link: `sudo nano /var/www/staff/index.html`, then replace
+  `PASTE-INVITE-LINK-HERE` (and `<HELP-CONTACT>`).
+- The main domain goes through the Namecheap proxy to the droplet on plain :80. So the
+  staff password travels unencrypted on that last hop. Use a password just for this
+  page.
 
 ## 3. Stop the laptops sleeping on AC power
 
@@ -77,7 +91,7 @@ Tell the client in writing before you install the agent. Something like:
 > ask us to remove it at any time.
 
 Get a "yes" back (chat or email) and keep it. If they want to be asked first each
-time, turn on **user consent** in the Shop group: **Edit device group** →
+time, turn on **user consent** in the hardware store group: **Edit device group** →
 **User Consent** → tick **Desktop**, **Terminal** and **Files**. The person at the
 laptop then clicks Allow before a session starts.
 
