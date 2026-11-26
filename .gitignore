@@ -1,0 +1,14 @@
+# Real Aronium data and any DB copies: never commit
+fixtures/
+*.db
+*.db-journal
+*.db-wal
+*.bak
+# Downloaded binaries
+tools/
+# Per-machine files
+config.json
+sync.log
+state/
+backups/
+testresults/

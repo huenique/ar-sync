@@ -1,0 +1,12 @@
+{
+  "role": "reader",
+  "oneDriveFolder": "%OneDrive%\aronium",
+  "dbPath": "%LOCALAPPDATA%\Aronium\Data\pos.db",
+  "aroniumExe": "",
+  "aroniumProcessName": "Aronium",
+  "shopHours": { "open": "08:00", "close": "21:00", "days": ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"] },
+  "staleMinutes": 60,
+  "ownerContact": "the owner",
+  "historyDays": 30,
+  "keepBackups": 10
+}
