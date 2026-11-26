@@ -20,6 +20,7 @@ BeforeAll {
         Mock Show-ConfirmBox -ModuleName AroniumSync { $false }
         Mock Register-SyncTasks -ModuleName AroniumSync { }
         Mock Register-SyncProtocol -ModuleName AroniumSync { }
+        Mock Set-SyncShortcuts -ModuleName AroniumSync { }
         Mock Stop-Process -ModuleName AroniumSync { throw 'Stop-Process must never be called' }
     }
 
@@ -549,6 +550,11 @@ Describe 'Install pieces (generated only, nothing registered)' {
         $x.Task.Actions.Exec.Arguments | Should -Match 'publish\.ps1'
     }
 
+    It 'seller logon trigger waits 2-5 min so OneDrive can bring down writer.json first' {
+        [xml]$x = Get-SyncTaskXml -Role seller -ScriptPath 'C:\x\publish.ps1' -UserId 'PC\shop'
+        $x.Task.Triggers.LogonTrigger.Delay | Should -Match '^PT[2-5]M$'
+    }
+
     It 'reader task runs every 5 min as the logged-on user' {
         [xml]$x = Get-SyncTaskXml -Role reader -ScriptPath 'C:\x\check.ps1' -UserId 'PC\shop'
         $x.Task.Principals.Principal.LogonType | Should -Be 'InteractiveToken'
@@ -587,5 +593,175 @@ Describe 'sqlite3 stdin encoding' {
             $r = InModuleScope AroniumSync -Parameters @{ C = $L.A } { param($C) Invoke-Sqlite -Config $C -Database $C.dbPath -Sql 'SELECT 41+1;' -ReadOnly }
             $r | Should -Be '42'
         } finally { [Console]::InputEncoding = $old }
+    }
+}
+
+Describe 'Example config' {
+    It 'config.example.json parses and its paths expand' {
+        $c = Get-SyncConfig -Path (Join-Path $RepoRoot 'config.example.json')
+        $c.dbPath | Should -BeLike '*\Aronium\Data\pos.db'
+        $c.dbPath | Should -Not -BeLike '*%LOCALAPPDATA%*'
+        $c.oneDriveFolder | Should -BeLike '*\aronium'
+    }
+}
+
+Describe 'Boot race after a takeover (<Kind> DB)' -ForEach $Cases {
+    BeforeEach {
+        Initialize-Mocks
+        Mock Show-ConfirmBox -ModuleName AroniumSync { $true }
+        $L = New-TwoLaptops -Kind $Kind
+        $A = $L.A; $B = $L.B
+        Invoke-Publish -Config $A -Now $Now -HostName 'LAPTOP-A' | Should -Be 'published'
+        Invoke-Takeover -Config $B -Now $Now.AddMinutes(90) -HostName 'LAPTOP-B' | Should -Be 'taken-over'
+        # A boots. OneDrive has brought down latest.json but not the new writer.json yet.
+        Write-JsonFile -Path (Join-Path $A.oneDriveFolder 'writer.json') -Object ([pscustomobject]@{ host = 'LAPTOP-A'; since = (Format-SyncTime $Now) })
+        $latestBefore = Get-Latest $B
+        $historyBefore = @(Get-ChildItem (Join-Path $A.oneDriveFolder 'history')).Count
+    }
+
+    It 'the stale old seller does not overwrite the new copy and toasts instead' {
+        Add-TestSale -Database $A.dbPath
+        Invoke-Publish -Config $A -Now $Now.AddMinutes(100) -HostName 'LAPTOP-A' | Should -Be 'not-writer'
+        $after = Get-Latest $B
+        $after.sha256 | Should -Be $latestBefore.sha256
+        $after.host | Should -Be 'LAPTOP-B'
+        @(Get-ChildItem (Join-Path $A.oneDriveFolder 'history')).Count | Should -Be $historyBefore
+        Should -Invoke Show-SyncToast -ModuleName AroniumSync -Times 1 -Exactly -ParameterFilter {
+            $Kind -eq 'not-writer' -and $Persistent -and $Text -like 'This laptop is no longer the selling laptop*'
+        }
+    }
+
+    It 'the new seller keeps publishing once writer.json has caught up' {
+        Write-JsonFile -Path (Join-Path $B.oneDriveFolder 'writer.json') -Object ([pscustomobject]@{ host = 'LAPTOP-B'; since = (Format-SyncTime $Now.AddMinutes(90)) })
+        Add-TestSale -Database $B.dbPath
+        Invoke-Publish -Config $B -Now $Now.AddMinutes(105) -HostName 'LAPTOP-B' | Should -Be 'published'
+    }
+}
+
+Describe 'Restore fail-safe' {
+    BeforeEach {
+        Initialize-Mocks
+        $L = New-TwoLaptops -Kind 'synthetic'
+        $A = $L.A; $B = $L.B
+        Add-TestSale -Database $A.dbPath
+        Invoke-Publish -Config $A -Now $Now -HostName 'LAPTOP-A' | Out-Null
+        $exe = Join-Path $L.Root 'Aronium.Pos.exe'
+        Set-Content -LiteralPath $exe -Value 'not really a program'
+        $B.aroniumExe = $exe
+        $in = Join-Path $L.Root 'in.db'
+        Copy-Item (Join-Path $A.oneDriveFolder 'latest.db') $in
+        $shaBefore = Get-FileSha256 $B.dbPath
+    }
+
+    It 'treats Aronium as running when its program file is in use, even if no process matched' {
+        $hold = [IO.File]::Open($exe, 'Open', 'Read', 'Read')   # a running .exe is held like this
+        try {
+            { Invoke-Restore -Config $B -IncomingPath $in -ExpectedSha (Get-Latest $A).sha256 } | Should -Throw '*program file is in use*'
+            Invoke-Check -Config $B -Now $Now | Should -Be 'notified'
+        } finally { $hold.Dispose() }
+        Get-FileSha256 $B.dbPath | Should -Be $shaBefore
+    }
+
+    It 'treats Aronium as running when pos.db is held open by another program' {
+        $hold = [IO.File]::Open($B.dbPath, 'Open', 'ReadWrite', 'ReadWrite')   # how sqlite holds it
+        try {
+            { Invoke-Restore -Config $B -IncomingPath $in -ExpectedSha (Get-Latest $A).sha256 } | Should -Throw '*pos.db is open*'
+        } finally { $hold.Dispose() }
+        Get-FileSha256 $B.dbPath | Should -Be $shaBefore
+    }
+
+    It 'treats Aronium as running when the process list cannot be read' {
+        Mock Get-AroniumProcess -ModuleName AroniumSync { throw 'access denied' }
+        { Invoke-Restore -Config $B -IncomingPath $in -ExpectedSha (Get-Latest $A).sha256 } | Should -Throw '*could not list processes*'
+        Get-FileSha256 $B.dbPath | Should -Be $shaBefore
+    }
+
+    It 'restores normally when the program file exists but nothing holds it' {
+        Invoke-Check -Config $B -Now $Now | Should -Be 'restored'
+    }
+}
+
+Describe 'Finding Aronium by name and by exe path (real process list)' {
+    BeforeEach {
+        $self = Get-Process -Id $PID
+        $cfg = @{ aroniumProcessName = 'NoSuchAroniumProcess'; aroniumExe = $self.Path }
+    }
+
+    It 'Get-AroniumProcess finds the program by its exe path when the configured name is wrong' {
+        @(Get-AroniumProcess -Config $cfg | Where-Object { $_.Id -eq $PID }).Count | Should -Be 1
+    }
+
+    It 'install check: ok when a live process has the configured name' {
+        $cfg.aroniumProcessName = $self.ProcessName
+        (Test-AroniumProcessName -Config $cfg).Status | Should -Be 'ok'
+    }
+
+    It 'install check: mismatch names the real process when Aronium runs under another name' {
+        $r = Test-AroniumProcessName -Config $cfg
+        $r.Status | Should -Be 'mismatch'
+        $r.Names | Should -Contain $self.ProcessName
+    }
+
+    It 'install check: not-running when nothing matches' {
+        $cfg.aroniumExe = 'C:\nowhere\NotHere.exe'
+        (Test-AroniumProcessName -Config $cfg).Status | Should -Be 'not-running'
+    }
+}
+
+Describe 'Seller switch guard and hand-back (<Kind> DB)' -ForEach $Cases {
+    BeforeEach {
+        Initialize-Mocks
+        Mock Show-ConfirmBox -ModuleName AroniumSync { $true }
+        $L = New-TwoLaptops -Kind $Kind
+        $A = $L.A; $B = $L.B
+        $counters0 = Get-Counters $A.dbPath
+        Invoke-Publish -Config $A -Now $Now -HostName 'LAPTOP-A' | Out-Null
+        Invoke-Takeover -Config $B -Now $Now.AddMinutes(90) -HostName 'LAPTOP-B' | Should -Be 'taken-over'
+        Add-TestSale -Database $B.dbPath
+        Invoke-Publish -Config $B -Now $Now.AddMinutes(95) -HostName 'LAPTOP-B' | Should -Be 'published'
+        (Get-Item -LiteralPath $A.dbPath).LastWriteTime = $Now   # A was switched off before the takeover
+    }
+
+    It 'refuses to make the stale old seller the seller again and points to the README' {
+        Get-SellerSwitchBlock -Config $A -HostName 'LAPTOP-A' | Should -BeLike '*LAPTOP-B*Give the selling role back*'
+        $r = Set-SyncRole -Config $A -Role seller -HostName 'LAPTOP-A' -Now $Now.AddMinutes(100)
+        $r.Status | Should -Be 'refused'
+        (Get-Writer $B).host | Should -Be 'LAPTOP-B'
+        (Get-Latest $B).host | Should -Be 'LAPTOP-B'
+        (Get-SyncConfig -Path $A.configPath).role | Should -Be 'seller'
+    }
+
+    It '-Force overrides the guard' {
+        $r = Set-SyncRole -Config $A -Role seller -Force -HostName 'LAPTOP-A' -Now $Now.AddMinutes(100)
+        $r.Status | Should -Be 'seller'
+        (Get-Writer $B).host | Should -Be 'LAPTOP-A'
+    }
+
+    It 'does not refuse once this laptop holds the same data as the published copy' {
+        (Set-SyncRole -Config $A -Role reader -HostName 'LAPTOP-A' -Now $Now.AddMinutes(100)).Status | Should -Be 'reader'
+        Invoke-Check -Config $A -Now $Now.AddMinutes(100) -HostName 'LAPTOP-A' | Should -Be 'restored'
+        (Get-Item -LiteralPath $A.dbPath).LastWriteTime = $Now
+        Get-SellerSwitchBlock -Config $A -HostName 'LAPTOP-A' | Should -BeNullOrEmpty
+    }
+
+    It 'hand-back (reader, restore, Take over) keeps the sales from B and moves receipt numbers on again' {
+        $bDocs = Get-DocCount $B.dbPath
+        (Set-SyncRole -Config $A -Role reader -HostName 'LAPTOP-A' -Now $Now.AddMinutes(100)).Status | Should -Be 'reader'
+        (Get-SyncConfig -Path $A.configPath).role | Should -Be 'reader'
+        Should -Invoke Register-SyncTasks -ModuleName AroniumSync -Times 1 -Exactly -ParameterFilter { $Role -eq 'reader' }
+        Invoke-Check -Config $A -Now $Now.AddMinutes(100) -HostName 'LAPTOP-A' | Should -Be 'restored'
+        Get-DocCount $A.dbPath | Should -Be $bDocs
+
+        Invoke-Takeover -Config $A -Now $Now.AddMinutes(110) -HostName 'LAPTOP-A' | Should -Be 'taken-over'
+        $after = Get-Counters $A.dbPath
+        foreach ($k in $counters0.Keys) { $after[$k] | Should -Be ($counters0[$k] + 1000) }
+        (Get-Writer $A).host | Should -Be 'LAPTOP-A'
+        (Get-Latest $A).host | Should -Be 'LAPTOP-A'
+
+        Invoke-Publish -Config $B -Now $Now.AddMinutes(115) -HostName 'LAPTOP-B' | Should -Be 'not-writer'
+        (Set-SyncRole -Config $B -Role reader -HostName 'LAPTOP-B' -Now $Now.AddMinutes(116)).Status | Should -Be 'reader'
+        Invoke-Check -Config $B -Now $Now.AddMinutes(116) -HostName 'LAPTOP-B' | Should -Be 'restored'
+        Get-DocCount $B.dbPath | Should -Be (Get-DocCount $A.dbPath)
+        Get-TestMarker -Database $B.dbPath | Should -Be 'reader'
     }
 }

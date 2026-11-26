@@ -11,14 +11,21 @@
 #   5. Registers the aronium-sync: link used by toast buttons (HKCU only)
 #   6. Registers the scheduled task: publish every 15 min (seller) or check every 5 min (reader)
 #   7. Puts "Aronium Sync - Clear pause" (and on the reader "Aronium Sync - Take over") on the desktop
+#
+# -AroniumProcessName: the name Get-Process shows for Aronium (default: the exe file name).
+#   It is checked against the running Aronium; leave Aronium open during install to verify it.
+# -Force: become the seller even if OneDrive has newer data from the other laptop (see README).
+# To switch an installed laptop between seller and reader, use set-role.ps1 instead.
 param(
     [Parameter(Mandatory)][ValidateSet('seller', 'reader')][string]$Role,
     [string]$OneDriveFolder,
     [string]$DbPath,
     [string]$AroniumExe,
+    [string]$AroniumProcessName,
     [string]$OwnerContact,
     [string]$ShopOpen,
-    [string]$ShopClose
+    [string]$ShopClose,
+    [switch]$Force
 )
 $ErrorActionPreference = 'Stop'
 $src = $PSScriptRoot
@@ -50,7 +57,7 @@ Write-Host "Installing Aronium Sync ($Role) for $env:USERNAME ..."
 # 1. scripts
 New-Item -ItemType Directory -Force -Path $app, (Join-Path $app 'bin'), (Join-Path $app 'backups'), (Join-Path $app 'state') | Out-Null
 foreach ($f in @('AroniumSync.psm1', 'publish.ps1', 'check.ps1', 'takeover.ps1', 'update-now.ps1', 'protocol-handler.ps1',
-        'clear-pause.ps1', 'uninstall.ps1', 'README.md', 'VERIFY.md')) {
+        'clear-pause.ps1', 'set-role.ps1', 'uninstall.ps1', 'README.md', 'VERIFY.md')) {
     $p = Join-Path $src $f
     if (Test-Path -LiteralPath $p) { Copy-Item -LiteralPath $p -Destination $app -Force }
 }
@@ -79,7 +86,7 @@ $cfgPath = Join-Path $app 'config.json'
 if (Test-Path -LiteralPath $cfgPath) {
     Write-Host "Keeping existing $cfgPath"
     $cfg = Get-SyncConfig -Path $cfgPath
-    Set-SyncConfigRole -Config $cfg -Role $Role
+    if ($AroniumProcessName) { Set-SyncConfigField -Config $cfg -Name 'aroniumProcessName' -Value $AroniumProcessName }
 } else {
     $od = $env:OneDrive; if (-not $od) { $od = $env:OneDriveConsumer }; if (-not $od) { $od = $env:OneDriveCommercial }
     if (-not $OneDriveFolder) {
@@ -99,12 +106,13 @@ if (Test-Path -LiteralPath $cfgPath) {
             $AroniumExe = Read-Default 'Full path to Aronium .exe (leave empty to skip relaunching)' $(if ($c.Count -gt 0) { $c[0].FullName } else { '' })
         }
     }
-    $procName = if ($AroniumExe) { [IO.Path]::GetFileNameWithoutExtension($AroniumExe) } else { 'Aronium' }
+    $procName = if ($AroniumProcessName) { $AroniumProcessName }
+    elseif ($AroniumExe) { [IO.Path]::GetFileNameWithoutExtension($AroniumExe) } else { 'Aronium' }
     if (-not $OwnerContact) { $OwnerContact = Read-Default 'Who to call when something is wrong (shown in alerts)' 'the owner' }
     if (-not $ShopOpen) { $ShopOpen = Read-Default 'Shop opens at (HH:MM)' '08:00' }
     if (-not $ShopClose) { $ShopClose = Read-Default 'Shop closes at (HH:MM)' '21:00' }
     $obj = [ordered]@{
-        role               = $Role
+        role               = 'reader'
         oneDriveFolder     = $OneDriveFolder
         dbPath             = $DbPath
         aroniumExe         = $AroniumExe
@@ -124,34 +132,45 @@ $share = Get-SharePaths -Config $cfg
 New-Item -ItemType Directory -Force -Path $share.Dir, $share.History | Out-Null
 try { & attrib.exe +P -U "$($share.Dir)" /S /D 2>&1 | Out-Null } catch { Write-Warning 'Could not pin the OneDrive folder; set "Always keep on this device" by hand.' }
 
-if ($Role -eq 'seller') {
-    $w = Read-JsonFile $share.WriterJson
-    if ($w -and $w.host -and $w.host -ne $env:COMPUTERNAME) {
-        $ans = Read-Host "OneDrive says '$($w.host)' is the selling laptop. Make THIS laptop the seller instead? (y/N)"
-        if ($ans -notmatch '^[yY]') { throw 'Install stopped: another laptop is the selling laptop. Install this one as reader, or use Take over.' }
+# The restore guard looks for Aronium by this process name (and by exe path): check it now.
+$pn = Test-AroniumProcessName -Config $cfg
+switch ($pn.Status) {
+    'ok' { Write-Host "Aronium is running as '$($cfg.aroniumProcessName)': process name OK." }
+    'mismatch' {
+        throw ("Aronium is running as '{0}', but the process name is set to '{1}'. Run install again with -AroniumProcessName {0}" -f ($pn.Names -join "', '"), $cfg.aroniumProcessName)
     }
-    Write-JsonFile -Path $share.WriterJson -Object ([pscustomobject]@{ host = $env:COMPUTERNAME; since = (Format-SyncTime (Get-Date)) })
+    default {
+        Write-Host ''
+        Write-Warning ("COULD NOT CHECK the Aronium process name '{0}': Aronium is not running." -f $cfg.aroniumProcessName)
+        Write-Warning 'Open Aronium and run:  Get-Process | Where-Object { $_.Path -like ''*Aronium*'' } | Select-Object ProcessName, Path'
+        Write-Warning 'If ProcessName is different, run install again with -AroniumProcessName <that name>.'
+        Write-Host ''
+    }
+}
+
+if ($Role -eq 'seller') {
+    if (-not $Force) {
+        $block = Get-SellerSwitchBlock -Config $cfg
+        if ($block) { throw "Install stopped. $block" }
+        $w = Read-JsonFile $share.WriterJson
+        if ($w -and $w.host -and $w.host -ne $env:COMPUTERNAME) {
+            $ans = Read-Host "OneDrive says '$($w.host)' is the selling laptop. Make THIS laptop the seller instead? (y/N)"
+            if ($ans -notmatch '^[yY]') { throw 'Install stopped: another laptop is the selling laptop. Install this one as reader, or use Take over.' }
+        }
+    }
+    Set-WriterClaim -Config $cfg
 } else {
     # Whatever is in this laptop's pos.db now is not counted as "sales made here".
     Set-BaselineStamp -Config $cfg
 }
+Set-SyncConfigRole -Config $cfg -Role $Role
 
 # 5. toast button link, 6. scheduled task
 Register-SyncProtocol -HandlerScript (Join-Path $app 'protocol-handler.ps1')
 Register-SyncTasks -Config $cfg -Role $Role
 
 # 7. desktop shortcuts
-$desk = [Environment]::GetFolderPath('Desktop')
-$wsh = New-Object -ComObject WScript.Shell
-$shortcuts = @(@{ Name = 'Aronium Sync - Clear pause'; Script = 'clear-pause.ps1' })
-if ($Role -eq 'reader') { $shortcuts += @{ Name = 'Aronium Sync - Take over'; Script = 'takeover.ps1' } }
-foreach ($s in $shortcuts) {
-    $lnk = $wsh.CreateShortcut((Join-Path $desk ($s.Name + '.lnk')))
-    $lnk.TargetPath = Get-PowerShellExe
-    $lnk.Arguments = '-NoProfile -ExecutionPolicy Bypass -File "{0}"' -f (Join-Path $app $s.Script)
-    $lnk.WorkingDirectory = $app
-    $lnk.Save()
-}
+Set-SyncShortcuts -Config $cfg -Role $Role
 
 Write-SyncLog -Config $cfg -Message "Installed as $Role."
 Show-SyncToast -Config $cfg -Kind 'install' -Text ("Aronium Sync is set up. This laptop is the {0} laptop." -f $(if ($Role -eq 'seller') { 'selling' } else { 'viewing' }))

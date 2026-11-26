@@ -61,14 +61,19 @@ function Get-SyncConfig {
     return $cfg
 }
 
-function Set-SyncConfigRole {
-    # Rewrites only the role field, keeping the rest of config.json as the owner wrote it.
-    param([Parameter(Mandatory)][hashtable]$Config, [Parameter(Mandatory)][ValidateSet('seller', 'reader')][string]$Role)
+function Set-SyncConfigField {
+    # Rewrites one top-level field, keeping the rest of config.json as the owner wrote it.
+    param([Parameter(Mandatory)][hashtable]$Config, [Parameter(Mandatory)][string]$Name, [Parameter(Mandatory)]$Value)
     $raw = [IO.File]::ReadAllText($Config.configPath) | ConvertFrom-Json
-    if ($raw.PSObject.Properties.Name -contains 'role') { $raw.role = $Role }
-    else { $raw | Add-Member -NotePropertyName role -NotePropertyValue $Role }
+    if ($raw.PSObject.Properties.Name -contains $Name) { $raw.$Name = $Value }
+    else { $raw | Add-Member -NotePropertyName $Name -NotePropertyValue $Value }
     Write-FileAtomic -Path $Config.configPath -Text ($raw | ConvertTo-Json -Depth 5)
-    $Config.role = $Role
+    $Config[$Name] = $Value
+}
+
+function Set-SyncConfigRole {
+    param([Parameter(Mandatory)][hashtable]$Config, [Parameter(Mandatory)][ValidateSet('seller', 'reader')][string]$Role)
+    Set-SyncConfigField -Config $Config -Name 'role' -Value $Role
 }
 
 function Write-SyncLog {
@@ -125,7 +130,8 @@ function Get-SyncState {
     $o = Read-JsonFile (Join-Path $Config.stateDir 'state.json')
     $h = @{}
     if ($o) { foreach ($p in $o.PSObject.Properties) { $h[$p.Name] = $p.Value } }
-    foreach ($k in @('notifiedSha', 'notifiedAt', 'laterSha', 'staleToastFor', 'pausedFingerprint', 'ackFingerprint', 'pausedToastAt', 'notWriterToastAt')) {
+    foreach ($k in @('notifiedSha', 'notifiedAt', 'laterSha', 'staleToastFor', 'pausedFingerprint', 'ackFingerprint', 'pausedToastAt', 'notWriterToastAt',
+            'lastPublishedAt', 'supersededPublishedAt')) {
         if (-not $h.ContainsKey($k)) { $h[$k] = $null }
     }
     return $h
@@ -302,9 +308,74 @@ function Get-DataFingerprint {
 # ---------------------------------------------------------------- desktop side effects (mocked in tests)
 
 function Get-AroniumProcess {
+    # Aronium processes in this session: by configured name, or by the configured exe path
+    # (so a wrong process name in config.json does not hide a running Aronium).
     param([Parameter(Mandatory)][hashtable]$Config)
     $session = [System.Diagnostics.Process]::GetCurrentProcess().SessionId
-    return @(Get-Process -Name $Config.aroniumProcessName -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $session })
+    $found = @(Get-Process -Name $Config.aroniumProcessName -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $session })
+    if ($Config.aroniumExe) {
+        foreach ($p in @(Get-Process -ErrorAction Stop | Where-Object { $_.SessionId -eq $session })) {
+            $path = $null
+            try { $path = $p.Path } catch { }
+            if ($path -and $path -eq $Config.aroniumExe -and -not ($found | Where-Object { $_.Id -eq $p.Id })) { $found += $p }
+        }
+    }
+    return $found
+}
+
+function Test-FileOpenElsewhere {
+    # 'open' if another process holds the file (exclusive open fails with a sharing violation),
+    # 'free' if not, 'unknown' if Windows would not say (e.g. no write access), 'missing' if absent.
+    param([Parameter(Mandatory)][string]$Path, [ValidateSet('Read', 'ReadWrite')][string]$Access = 'ReadWrite')
+    if (-not (Test-Path -LiteralPath $Path)) { return 'missing' }
+    try {
+        $fs = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]$Access, [IO.FileShare]::None)
+        $fs.Dispose()
+        return 'free'
+    } catch {
+        $e = $_.Exception
+        while ($e.InnerException) { $e = $e.InnerException }
+        if ($e -is [UnauthorizedAccessException]) { return 'unknown' }
+        if ($e -is [IO.IOException]) { return 'open' }
+        return 'unknown'
+    }
+}
+
+function Get-AroniumRunningReason {
+    # Fail-safe "is Aronium running?" for anything that replaces pos.db.
+    # Returns $null only when every check says no; otherwise a short reason.
+    param([Parameter(Mandatory)][hashtable]$Config)
+    try {
+        if (@(Get-AroniumProcess -Config $Config).Count -gt 0) { return 'process found' }
+    } catch {
+        return 'could not list processes (' + $_.Exception.Message + ')'
+    }
+    if ($Config.aroniumExe -and (Test-FileOpenElsewhere -Path $Config.aroniumExe) -eq 'open') {
+        return 'the Aronium program file is in use'
+    }
+    if ((Test-FileOpenElsewhere -Path $Config.dbPath) -eq 'open') { return 'pos.db is open in another program' }
+    return $null
+}
+
+function Test-AroniumProcessName {
+    # Install-time check of aroniumProcessName against what is actually running.
+    # Status: 'ok' (a live process has that name), 'mismatch' (Aronium runs under another name),
+    # 'not-running' (nothing to compare against).
+    param([Parameter(Mandatory)][hashtable]$Config)
+    $session = [System.Diagnostics.Process]::GetCurrentProcess().SessionId
+    $all = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $session })
+    if (@($all | Where-Object { $_.ProcessName -eq $Config.aroniumProcessName }).Count -gt 0) {
+        return @{ Status = 'ok'; Names = @($Config.aroniumProcessName) }
+    }
+    $hits = @()
+    foreach ($p in $all) {
+        $path = $null
+        try { $path = $p.Path } catch { }
+        if (-not $path) { continue }
+        if (($Config.aroniumExe -and $path -eq $Config.aroniumExe) -or ((Split-Path -Leaf $path) -like 'Aronium*')) { $hits += $p.ProcessName }
+    }
+    if ($hits.Count -gt 0) { return @{ Status = 'mismatch'; Names = @($hits | Sort-Object -Unique) } }
+    return @{ Status = 'not-running'; Names = @() }
 }
 
 function Close-AroniumGracefully {
@@ -418,17 +489,28 @@ function Invoke-Publish {
         $writer = Read-JsonFile $share.WriterJson
         if ($writer -and $writer.host -and $writer.host -ne $HostName) {
             Write-SyncLog -Config $Config -Level WARN -Message "Not publishing: writer is now $($writer.host)."
-            $state = Get-SyncState -Config $Config
-            $last = ConvertTo-SyncTime $state.notWriterToastAt
-            if (-not $last -or ([DateTimeOffset]$Now - $last).TotalMinutes -ge 60) {
-                Show-SyncToast -Config $Config -Kind 'not-writer' -Persistent -Text ("This laptop is no longer the selling laptop. Do not sell on it. Call {0}." -f $Config.ownerContact)
-                $state.notWriterToastAt = Format-SyncTime $Now
-                Save-SyncState -Config $Config -State $state
-            }
+            Show-NotWriterToast -Config $Config -Now $Now
             return 'not-writer'
         }
         if (-not $writer) {
             Write-JsonFile -Path $share.WriterJson -Object ([pscustomobject]@{ host = $HostName; since = (Format-SyncTime $Now) })
+        }
+        # writer.json can arrive after latest.json (OneDrive syncs files in any order), e.g. when this
+        # laptop boots after the other one took over. A copy from another laptop that is newer than
+        # anything this laptop published or knowingly replaced means someone else is selling now.
+        $current = Read-JsonFile $share.LatestJson
+        if ($current -and $current.host -and $current.host -ne $HostName -and $current.published_at) {
+            $state = Get-SyncState -Config $Config
+            $floor = $null
+            foreach ($t in @($state.lastPublishedAt, $state.supersededPublishedAt)) {
+                $v = ConvertTo-SyncTime $t
+                if ($v -and (-not $floor -or $v -gt $floor)) { $floor = $v }
+            }
+            if (-not $floor -or (ConvertTo-SyncTime $current.published_at) -gt $floor) {
+                Write-SyncLog -Config $Config -Level WARN -Message ("Not publishing: latest.json is from {0} ({1}), newer than this laptop's last publish." -f $current.host, $current.published_at)
+                Show-NotWriterToast -Config $Config -Now $Now
+                return 'not-writer'
+            }
         }
 
         if (-not (Test-Path -LiteralPath $Config.dbPath)) { throw "Aronium database not found at $($Config.dbPath)" }
@@ -455,6 +537,9 @@ function Invoke-Publish {
                 fingerprint  = $fp
                 size         = (Get-Item -LiteralPath $tmp).Length
             })
+        $state = Get-SyncState -Config $Config
+        $state.lastPublishedAt = Format-SyncTime $Now
+        Save-SyncState -Config $Config -State $state
         Remove-OldHistory -Config $Config -Now $Now
         Write-SyncLog -Config $Config -Message ("Published {0} (sha {1})" -f $(if ($changed) { 'new copy' } else { 'heartbeat, data unchanged' }), $sha.Substring(0, 12))
         return $(if ($changed) { 'published' } else { 'unchanged' })
@@ -468,6 +553,57 @@ function Invoke-Publish {
         if ($tmp -and (Test-Path -LiteralPath $tmp)) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
         Exit-SyncMutex $mutex
     }
+}
+
+function Show-NotWriterToast {
+    # At most once an hour.
+    param([Parameter(Mandatory)][hashtable]$Config, [Parameter(Mandatory)][datetime]$Now)
+    $state = Get-SyncState -Config $Config
+    $last = ConvertTo-SyncTime $state.notWriterToastAt
+    if (-not $last -or ([DateTimeOffset]$Now - $last).TotalMinutes -ge 60) {
+        Show-SyncToast -Config $Config -Kind 'not-writer' -Persistent -Text ("This laptop is no longer the selling laptop. Do not sell on it. Call {0}." -f $Config.ownerContact)
+        $state.notWriterToastAt = Format-SyncTime $Now
+        Save-SyncState -Config $Config -State $state
+    }
+}
+
+function Set-WriterClaim {
+    # Makes this laptop the writer in writer.json and remembers which published copy it replaced,
+    # so its own first publish is not mistaken for an old seller waking up (see Invoke-Publish).
+    param([Parameter(Mandatory)][hashtable]$Config, [datetime]$Now = (Get-Date), [string]$HostName = $env:COMPUTERNAME)
+    $share = Get-SharePaths -Config $Config
+    if (-not (Test-Path -LiteralPath $share.Dir)) { New-Item -ItemType Directory -Force -Path $share.Dir | Out-Null }
+    $prev = Read-JsonFile $share.WriterJson
+    $latest = Read-JsonFile $share.LatestJson
+    Write-JsonFile -Path $share.WriterJson -Object ([pscustomobject]@{
+            host          = $HostName
+            since         = (Format-SyncTime $Now)
+            previous_host = $(if ($prev -and $prev.host -ne $HostName) { $prev.host } else { $null })
+        })
+    $state = Get-SyncState -Config $Config
+    $state.supersededPublishedAt = $null
+    if ($latest -and $latest.published_at) {
+        $state.supersededPublishedAt = (ConvertTo-SyncTime $latest.published_at).ToString('yyyy-MM-ddTHH:mm:sszzz', [Globalization.CultureInfo]::InvariantCulture)
+    }
+    $state.notWriterToastAt = $null
+    Save-SyncState -Config $Config -State $state
+}
+
+function Get-SellerSwitchBlock {
+    # Why this laptop must not become the seller, or $null. Blocks when OneDrive holds a copy from
+    # another laptop with different data that is newer than this laptop's pos.db: publishing would
+    # throw away that laptop's sales and roll receipt numbers back.
+    param([Parameter(Mandatory)][hashtable]$Config, [string]$HostName = $env:COMPUTERNAME)
+    $latest = Read-JsonFile (Get-SharePaths -Config $Config).LatestJson
+    if (-not $latest -or -not $latest.host -or $latest.host -eq $HostName -or -not $latest.published_at) { return $null }
+    if (-not (Test-Path -LiteralPath $Config.dbPath)) { return $null }
+    if ($latest.fingerprint -and $latest.fingerprint -eq (Get-DataFingerprint -Config $Config -Database $Config.dbPath)) { return $null }
+    $theirs = ConvertTo-SyncTime $latest.published_at
+    $mine = [DateTimeOffset](Get-Item -LiteralPath $Config.dbPath).LastWriteTime
+    if ($theirs -le $mine) { return $null }
+    return ("OneDrive has a newer copy from {0} (published {1}) than this laptop's data (last changed {2}). " +
+        "Making this laptop the seller would overwrite that laptop's sales. See 'Give the selling role back' in README.md, " +
+        "or use -Force if you are sure.") -f $latest.host, $theirs.LocalDateTime.ToString('yyyy-MM-dd HH:mm'), $mine.LocalDateTime.ToString('yyyy-MM-dd HH:mm')
 }
 
 function Remove-OldHistory {
@@ -597,7 +733,8 @@ function Invoke-Restore {
         $Latest,
         [datetime]$Now = (Get-Date)
     )
-    if (@(Get-AroniumProcess -Config $Config).Count -gt 0) { throw 'Aronium is running; restore refused.' }
+    $running = Get-AroniumRunningReason -Config $Config
+    if ($running) { throw "Aronium is running ($running); restore refused." }
     foreach ($suffix in @('-journal', '-wal')) {
         if (Test-Path -LiteralPath ($Config.dbPath + $suffix)) { throw "pos.db$suffix exists (Aronium may have crashed mid-save); restore refused." }
     }
@@ -710,7 +847,7 @@ function Invoke-Check {
             return 'waiting'
         }
 
-        if (@(Get-AroniumProcess -Config $Config).Count -gt 0) {
+        if (Get-AroniumRunningReason -Config $Config) {
             if ($state.laterSha -eq $latest.sha256) { return 'later' }
             $notifiedAt = ConvertTo-SyncTime $state.notifiedAt
             if ($state.notifiedSha -eq $latest.sha256 -and $notifiedAt -and ([DateTimeOffset]$Now - $notifiedAt).TotalMinutes -lt 60) { return 'notified' }
@@ -837,12 +974,7 @@ function Invoke-Takeover {
         if ((Get-TableColumns -Config $Config -Database $Config.dbPath -Tables @('Counter')).ContainsKey('Counter')) {
             Invoke-Sqlite -Config $Config -Database $Config.dbPath -Sql "BEGIN; UPDATE Counter SET Value = Value + $($script:CounterBump); COMMIT;" | Out-Null
         }
-        $prev = Read-JsonFile $share.WriterJson
-        Write-JsonFile -Path $share.WriterJson -Object ([pscustomobject]@{
-                host          = $HostName
-                since         = (Format-SyncTime $Now)
-                previous_host = $(if ($prev) { $prev.host } else { $null })
-            })
+        Set-WriterClaim -Config $Config -Now $Now -HostName $HostName
         Set-SyncConfigRole -Config $Config -Role 'seller'
         Register-SyncTasks -Config $Config -Role 'seller'
         if (Test-Path -LiteralPath $Config.pauseFlag) { Remove-Item -LiteralPath $Config.pauseFlag -Force }
@@ -932,13 +1064,15 @@ function Get-SyncTaskXml {
     $esc = { param($s) [System.Security.SecurityElement]::Escape([string]$s) }
     $interval = if ($Role -eq 'seller') { 'PT15M' } else { 'PT5M' }
     $startStr = $Start.ToString('yyyy-MM-ddTHH:mm:ss', [Globalization.CultureInfo]::InvariantCulture)
+    # The seller waits 3 min after logon so OneDrive can bring down writer.json / latest.json first.
+    $logonDelay = if ($Role -eq 'seller') { '<Delay>PT3M</Delay>' } else { '' }
     $triggers = @"
     <TimeTrigger>
       <Repetition><Interval>$interval</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition>
       <StartBoundary>$startStr</StartBoundary>
       <Enabled>true</Enabled>
     </TimeTrigger>
-    <LogonTrigger><Enabled>true</Enabled><UserId>$(& $esc $UserId)</UserId></LogonTrigger>
+    <LogonTrigger><Enabled>true</Enabled><UserId>$(& $esc $UserId)</UserId>$logonDelay</LogonTrigger>
 "@
     if ($Role -eq 'seller' -and -not $NoEventTrigger) {
         $query = '<QueryList><Query Id="0" Path="System"><Select Path="System">*[System[Provider[@Name=''User32''] and EventID=1074]]</Select></Query></QueryList>'
@@ -1003,6 +1137,73 @@ function Register-SyncTasks {
 
 function Unregister-SyncTasks {
     foreach ($n in $script:TaskNames.Values) { Unregister-ScheduledTask -TaskName $n -Confirm:$false -ErrorAction SilentlyContinue }
+}
+
+function Set-SyncShortcuts {
+    # Desktop icons: Clear pause on both laptops, Take over on the viewing laptop only.
+    param([Parameter(Mandatory)][hashtable]$Config, [Parameter(Mandatory)][ValidateSet('seller', 'reader')][string]$Role)
+    $appDir = Split-Path -Parent $Config.configPath
+    $desk = [Environment]::GetFolderPath('Desktop')
+    $wsh = New-Object -ComObject WScript.Shell
+    $want = @(@{ Name = 'Aronium Sync - Clear pause'; Script = 'clear-pause.ps1' })
+    if ($Role -eq 'reader') { $want += @{ Name = 'Aronium Sync - Take over'; Script = 'takeover.ps1' } }
+    else {
+        $old = Join-Path $desk 'Aronium Sync - Take over.lnk'
+        if (Test-Path -LiteralPath $old) { Remove-Item -LiteralPath $old -Force }
+    }
+    foreach ($s in $want) {
+        $lnk = $wsh.CreateShortcut((Join-Path $desk ($s.Name + '.lnk')))
+        $lnk.TargetPath = Get-PowerShellExe
+        $lnk.Arguments = '-NoProfile -ExecutionPolicy Bypass -File "{0}"' -f (Join-Path $appDir $s.Script)
+        $lnk.WorkingDirectory = $appDir
+        $lnk.Save()
+    }
+}
+
+function Set-SyncRole {
+    # Switches this laptop between seller and reader in place (no uninstall, no downloads).
+    # Returns @{ Status = 'reader' | 'seller' | 'already' | 'refused' | 'busy'; Message = text }.
+    param(
+        [Parameter(Mandatory)][hashtable]$Config,
+        [Parameter(Mandatory)][ValidateSet('seller', 'reader')][string]$Role,
+        [switch]$Force,
+        [datetime]$Now = (Get-Date),
+        [string]$HostName = $env:COMPUTERNAME
+    )
+    $share = Get-SharePaths -Config $Config
+    $writer = Read-JsonFile $share.WriterJson
+    if ($Role -eq 'seller' -and $Config.role -eq 'seller' -and $writer -and $writer.host -eq $HostName) {
+        return @{ Status = 'already'; Message = 'This laptop is already the selling laptop.' }
+    }
+    if ($Role -eq 'reader' -and $Config.role -eq 'reader') {
+        return @{ Status = 'already'; Message = 'This laptop is already the viewing laptop.' }
+    }
+    if ($Role -eq 'seller' -and -not $Force) {
+        $block = Get-SellerSwitchBlock -Config $Config -HostName $HostName
+        if ($block) { return @{ Status = 'refused'; Message = $block } }
+        if ($writer -and $writer.host -and $writer.host -ne $HostName) {
+            return @{ Status = 'refused'; Message = ("OneDrive says {0} is the selling laptop. Use Take over if it is down, or -Force if you are sure." -f $writer.host) }
+        }
+    }
+    $mutex = Get-SyncMutex -Config $Config -WaitSeconds 60
+    if (-not $mutex) { return @{ Status = 'busy'; Message = 'Another sync step is running. Try again in a minute.' } }
+    try {
+        if ($Role -eq 'seller') { Set-WriterClaim -Config $Config -Now $Now -HostName $HostName }
+        else {
+            # Whatever is in pos.db now is not "sales made here": the next check loads the seller's copy
+            # (the current file is kept in backups).
+            Set-BaselineStamp -Config $Config -Now $Now
+        }
+        Set-SyncConfigRole -Config $Config -Role $Role
+        Register-SyncTasks -Config $Config -Role $Role
+        Set-SyncShortcuts -Config $Config -Role $Role
+        Write-SyncLog -Config $Config -Message "Role changed to $Role with set-role."
+    } finally { Exit-SyncMutex $mutex }
+    if ($Role -eq 'seller') {
+        [void](Invoke-Publish -Config $Config -Now $Now -HostName $HostName)
+        return @{ Status = 'seller'; Message = 'This laptop is now the selling laptop.' }
+    }
+    return @{ Status = 'reader'; Message = 'This laptop is now the viewing laptop. It loads the selling laptop''s copy within 5 minutes.' }
 }
 
 # ---------------------------------------------------------------- sqlite3.exe download (pinned)
