@@ -599,6 +599,22 @@ Describe 'sqlite3 stdin encoding' {
     }
 }
 
+Describe 'Start-Aronium' {
+    It 'starts Aronium in its own folder so it finds Lang\ (no raw "Order.Subtotal" keys)' {
+        $dir = Join-Path $TestDrive 'Program Files\Aronium'
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        $exe = Join-Path $dir 'Aronium.exe'
+        Set-Content -LiteralPath $exe -Value 'x'
+        Mock Start-Process -ModuleName AroniumSync { }
+        Push-Location $env:SystemRoot
+        try { Start-Aronium -Config @{ aroniumExe = $exe; logPath = (Join-Path $TestDrive 'sync.log') } | Should -BeTrue }
+        finally { Pop-Location }
+        Should -Invoke Start-Process -ModuleName AroniumSync -Times 1 -Exactly -ParameterFilter {
+            $FilePath -eq $exe -and $WorkingDirectory -eq $dir
+        }
+    }
+}
+
 Describe 'Example config' {
     It 'config.example.json parses and its paths expand' {
         $c = Get-SyncConfig -Path (Join-Path $RepoRoot 'config.example.json')

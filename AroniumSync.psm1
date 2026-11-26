@@ -395,7 +395,9 @@ function Close-AroniumGracefully {
 function Start-Aronium {
     param([Parameter(Mandatory)][hashtable]$Config)
     if ($Config.aroniumExe -and (Test-Path -LiteralPath $Config.aroniumExe)) {
-        Start-Process -FilePath $Config.aroniumExe | Out-Null
+        # Aronium loads Lang\ (and other files) relative to its working directory. Started from
+        # System32 or the script folder it shows raw keys like "Order.Subtotal", so start it in its own folder.
+        Start-Process -FilePath $Config.aroniumExe -WorkingDirectory (Split-Path -Parent $Config.aroniumExe) | Out-Null
         return $true
     }
     Write-SyncLog -Config $Config -Level WARN -Message 'Aronium exe path not set or missing; not relaunching.'
