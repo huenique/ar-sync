@@ -1,6 +1,7 @@
 package rt
 
 import (
+	"database/sql"
 	"fmt"
 	"strings"
 	"time"
@@ -280,4 +281,44 @@ func (d *DB) MigrationCount() (int64, error) {
 	var n int64
 	err := d.one("SELECT count(*) FROM Migration").Scan(&n)
 	return n, err
+}
+
+// MaxLocalID is the highest Id in a table (0 if empty); used for local-only
+// tables such as ZReport.
+func (d *DB) MaxLocalID(tbl string) (int64, error) {
+	var n sql.NullInt64
+	err := d.one("SELECT max(Id) FROM " + qi(tbl)).Scan(&n)
+	return n.Int64, err
+}
+
+// Uninstall removes the triggers and every _rt_ table: pos.db goes back to
+// plain Aronium. Used by the kill switch before one-writer sync resumes.
+func (d *DB) Uninstall() error {
+	if err := d.begin(false); err != nil {
+		return err
+	}
+	if err := d.dropTriggers(); err != nil {
+		d.rollback()
+		return err
+	}
+	rows, err := d.query(`SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '\_rt\_%' ESCAPE '\'`)
+	if err != nil {
+		d.rollback()
+		return err
+	}
+	var names []string
+	for rows.Next() {
+		var s string
+		rows.Scan(&s)
+		names = append(names, s)
+	}
+	rows.Close()
+	for _, t := range names {
+		if _, err := d.exec("DROP TABLE " + qi(t)); err != nil {
+			d.rollback()
+			return err
+		}
+	}
+	_, err = d.exec("COMMIT")
+	return err
 }

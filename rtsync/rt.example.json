@@ -1,0 +1,13 @@
+{
+  "node": "A",
+  "peer": "B",
+  "role": "till",
+  "dbPath": "C:\Users\USER\AppData\Local\Aronium\Data\pos.db",
+  "listen": ":47800",
+  "peerUrls": ["http://LAPTOP-MVEPIKMR:47800"],
+  "key": "generate with: openssl rand -hex 32 (same on both laptops)",
+  "shareDir": "C:\Users\USER\OneDrive\aronium",
+  "notifyCmd": ["C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", "C:\Users\USER\AppData\Local\AroniumSync\rt-notify.ps1"],
+  "laterFile": "C:\Users\USER\AppData\Local\AroniumSync\state\rt-later.flag",
+  "openHour": 8
+}

@@ -12,7 +12,7 @@ Set-StrictMode -Version 2.0
 $script:FingerprintTables = @('Document', 'DocumentItem', 'Payment', 'Product', 'Customer', 'Stock', 'StartingCash', 'ZReport')
 $script:PerPcTables = @('ApplicationProperty', 'PosPrinterSelection', 'PosPrinterSelectionSettings', 'PosPrinterSettings',
     'PrintStation', 'PrintStationPosPrinterSelection', 'SecurityKey')
-$script:Actions = @('update-now', 'later', 'takeover')
+$script:Actions = @('update-now', 'later', 'takeover', 'restart-aronium', 'restart-later')
 $script:CounterBump = 500
 $script:Utf8NoBom = New-Object System.Text.UTF8Encoding $false
 
@@ -404,6 +404,65 @@ function Start-Aronium {
     return $false
 }
 
+# ---------------------------------------------------------------- real-time sync (rtsync) hooks
+
+function Remove-RtSyncObjects {
+    # The real-time sidecar keeps its log, Id map and triggers inside pos.db (_rt_*). They belong
+    # to one laptop, so a copy published to OneDrive must not carry them: drop them from the copy.
+    param([Parameter(Mandatory)][hashtable]$Config, [Parameter(Mandatory)][string]$Database)
+    $rows = @(Invoke-Sqlite -Config $Config -Database $Database -Sql "SELECT type || ' ' || name FROM sqlite_master WHERE name LIKE '\_rt\_%' ESCAPE '\' AND type IN ('trigger','table') ORDER BY type DESC;")
+    $sql = New-Object System.Text.StringBuilder
+    foreach ($r in $rows) {
+        if (-not $r) { continue }
+        $kind, $name = $r.Split(' ', 2)
+        if ($name -notmatch '^_rt_[A-Za-z0-9_]+$') { continue }
+        [void]$sql.AppendLine(('DROP {0} IF EXISTS [{1}];' -f $kind.ToUpperInvariant(), $name))
+    }
+    if ($sql.Length -gt 0) { Invoke-Sqlite -Config $Config -Database $Database -Sql $sql.ToString() | Out-Null }
+}
+
+function Get-RtLaterPath {
+    param([Parameter(Mandatory)][hashtable]$Config)
+    return (Join-Path $Config.stateDir 'rt-later.flag')
+}
+
+function Set-RtLater {
+    # The cashier clicked Later on "restart Aronium": the sidecar waits an hour before asking again.
+    param([Parameter(Mandatory)][hashtable]$Config)
+    if (-not (Test-Path -LiteralPath $Config.stateDir)) { New-Item -ItemType Directory -Force -Path $Config.stateDir | Out-Null }
+    Write-FileAtomic -Path (Get-RtLaterPath -Config $Config) -Text (Get-Date -Format 's')
+}
+
+function Invoke-RestartAronium {
+    # Restart Aronium so its selling screen loads the other laptop's product and price changes.
+    # Closes gracefully (never force-kills: it may be mid-sale) and reopens in its own folder.
+    param([Parameter(Mandatory)][hashtable]$Config)
+    if (@(Get-AroniumProcess -Config $Config).Count -gt 0) {
+        if (-not (Close-AroniumGracefully -Config $Config -TimeoutSeconds 30)) {
+            Show-SyncToast -Config $Config -Kind 'rt-prices' -Text 'Aronium did not close (a sale or dialog may be open). Finish it, then try Restart again.'
+            return 'busy'
+        }
+    }
+    [void](Start-Aronium -Config $Config)
+    Write-SyncLog -Config $Config -Message 'Aronium restarted to load changes from the other laptop.'
+    return 'restarted'
+}
+
+function Invoke-RtNotify {
+    # Called by the sidecar (rt-notify.ps1). Kind 'restart' restarts Aronium; anything else is a toast.
+    param(
+        [Parameter(Mandatory)][hashtable]$Config,
+        [Parameter(Mandatory)][ValidatePattern('^[a-z-]{1,32}$')][string]$Kind,
+        [string]$Text = '',
+        [string[]]$Buttons = @()
+    )
+    if ($Kind -eq 'restart') { return (Invoke-RestartAronium -Config $Config) }
+    if ($Text.Length -gt 300) { $Text = $Text.Substring(0, 300) }
+    $ok = @($Buttons | Where-Object { $_ -in @('restart-aronium', 'restart-later') })
+    Show-SyncToast -Config $Config -Kind ('rt-' + $Kind) -Text $Text -Buttons $ok -Persistent:($Kind -in @('paused', 'killed'))
+    return 'shown'
+}
+
 function Show-ConfirmBox {
     # Yes/No box, topmost, with No as the default button. Returns $true only on Yes.
     param([Parameter(Mandatory)][string]$Text)
@@ -438,7 +497,7 @@ function Show-SyncToast {
         $texts = @((New-BTText -Text 'Aronium Sync'), (New-BTText -Text $Text))
         $binding = New-BTBinding -Children $texts
         $visual = New-BTVisual -BindingGeneric $binding
-        $labels = @{ 'update-now' = 'Update now'; 'later' = 'Later'; 'takeover' = 'Take over' }
+        $labels = @{ 'update-now' = 'Update now'; 'later' = 'Later'; 'takeover' = 'Take over'; 'restart-aronium' = 'Restart now'; 'restart-later' = 'Later' }
         $btns = @()
         foreach ($b in $Buttons) {
             if ($script:Actions -notcontains $b) { continue }
@@ -519,6 +578,7 @@ function Invoke-Publish {
         if (-not (Test-Path -LiteralPath $Config.dbPath)) { throw "Aronium database not found at $($Config.dbPath)" }
         $tmp = Join-Path $Config.stateDir ('publish-' + [guid]::NewGuid().ToString('N') + '.db')
         Backup-SqliteDb -Config $Config -Source $Config.dbPath -Destination $tmp
+        Remove-RtSyncObjects -Config $Config -Database $tmp
         if (-not (Test-SqliteIntegrity -Config $Config -Database $tmp)) { throw 'integrity check failed on the backup copy' }
         $sha = Get-FileSha256 $tmp
         $fp = Get-DataFingerprint -Config $Config -Database $tmp
@@ -1068,7 +1128,7 @@ function Invoke-Takeover {
 # ---------------------------------------------------------------- protocol handler
 
 function ConvertTo-SyncAction {
-    # Strict whitelist. Returns 'update-now' | 'later' | 'takeover', or $null for anything else.
+    # Strict whitelist. Returns one of $script:Actions, or $null for anything else.
     param([AllowNull()][AllowEmptyString()][string]$Uri)
     if ([string]::IsNullOrEmpty($Uri) -or $Uri.Length -gt 64) { return $null }
     $m = [regex]::Match($Uri, '^(?i:aronium-sync):(?://)?([a-z-]+)/?$')
@@ -1092,6 +1152,8 @@ function Invoke-ProtocolAction {
         'update-now' { [void](Invoke-UpdateNow -Config $Config) }
         'later' { Set-LaterAction -Config $Config }
         'takeover' { [void](Invoke-Takeover -Config $Config) }
+        'restart-aronium' { [void](Invoke-RestartAronium -Config $Config) }
+        'restart-later' { Set-RtLater -Config $Config }
     }
     return $action
 }

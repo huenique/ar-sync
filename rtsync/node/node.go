@@ -45,6 +45,15 @@ type Config struct {
 	// AroniumImage is the process watched for the trigger lifecycle
 	// (default Aronium.Pos.exe).
 	AroniumImage string `json:"aroniumImage"`
+	// Role is "till" (sells, owns End of day) or "office".
+	Role string `json:"role"`
+	// NotifyCmd runs ar-sync's rt-notify.ps1; the sidecar appends
+	// -Kind <kind> -Text <text> [-Buttons a,b]. Empty: notices go to the log only.
+	NotifyCmd []string `json:"notifyCmd"`
+	// LaterFile is written by ar-sync when the cashier clicks Later.
+	LaterFile string `json:"laterFile"`
+	// OpenHour: before this local hour a pending till restart runs by itself (default 8).
+	OpenHour int `json:"openHour"`
 }
 
 func (c *Config) defaults() {
@@ -60,6 +69,12 @@ func (c *Config) defaults() {
 	if c.StableSec == 0 {
 		c.StableSec = 15
 	}
+	if c.OpenHour == 0 {
+		c.OpenHour = 8
+	}
+	if c.Role == "" {
+		c.Role = "till"
+	}
 	if c.AroniumImage == "" {
 		c.AroniumImage = "Aronium.Pos.exe"
 	}
@@ -74,6 +89,9 @@ type Status struct {
 	LastPullVia string    `json:"lastPullVia"` // lan, share, deferred
 	LastError   string    `json:"lastError,omitempty"`
 	Applied     int64     `json:"applied"`
+	Paused      string    `json:"paused,omitempty"` // why sync is paused, if it is
+	Killed      bool      `json:"killed,omitempty"`
+	RestartDue  bool      `json:"restartDue,omitempty"`
 	PeerLastSeq int64     `json:"peerLastSeq"`
 	TriggersOn  bool      `json:"triggersOn"`
 }
@@ -90,6 +108,20 @@ type Node struct {
 	// OnApplied is called after peer changes were written (Phase 3 hooks the
 	// till's "restart Aronium" toast here). Receives the changed tables.
 	OnApplied func(tables map[string]int)
+
+	// Notify shows a toast through ar-sync (kind, text, buttons).
+	Notify func(kind, text string, buttons ...string)
+	// RestartAronium closes Aronium gracefully and reopens it.
+	RestartAronium func() error
+	// UpdaterRunning reports an Aronium installer or uninstaller running.
+	UpdaterRunning func() bool
+	// AroniumStarted returns when the running Aronium process started.
+	AroniumStarted func() (time.Time, bool)
+	// Now is the clock (tests move it).
+	Now func() time.Time
+
+	lastToast map[string]time.Time
+	killed    bool
 
 	client    *http.Client
 	startSeen time.Time
@@ -116,8 +148,13 @@ func New(cfg Config, lg *log.Logger) (*Node, error) {
 	if lg == nil {
 		lg = log.New(io.Discard, "", 0)
 	}
-	return &Node{cfg: cfg, eng: eng, log: lg, AroniumRunning: func() bool { return ProcessRunning(cfg.AroniumImage) },
-		client: &http.Client{Timeout: 10 * time.Second}}, nil
+	nd := &Node{cfg: cfg, eng: eng, log: lg, AroniumRunning: func() bool { return ProcessRunning(cfg.AroniumImage) },
+		client: &http.Client{Timeout: 10 * time.Second}, lastToast: map[string]time.Time{}, Now: time.Now,
+		UpdaterRunning: func() bool { return UpdaterRunning() },
+		AroniumStarted: func() (time.Time, bool) { return ProcessStarted(cfg.AroniumImage) }}
+	nd.Notify = nd.runNotify
+	nd.RestartAronium = func() error { return nd.runNotifyErr("restart", "Restarting Aronium to load the office's changes.") }
+	return nd, nil
 }
 
 // Close stops using the database.
@@ -377,11 +414,12 @@ func (n *Node) apply(b *rt.Batch) (int, error) {
 	})
 	if a > 0 {
 		n.log.Printf("applied %d changes from %s (seq %d..%d)", a, b.Origin, b.From, b.To)
+		tables := map[string]int{}
+		for _, c := range b.Changes {
+			tables[c.Table]++
+		}
+		n.catalogChanged(tables)
 		if n.OnApplied != nil {
-			tables := map[string]int{}
-			for _, c := range b.Changes {
-				tables[c.Table]++
-			}
 			n.OnApplied(tables)
 		}
 	}
@@ -549,7 +587,12 @@ func (n *Node) ReadShare() (int, error) {
 // Tick turns the capture triggers off when Aronium has closed, and back on once
 // it has run StableSec seconds with an unchanged Migration count.
 func (n *Node) Tick() error {
-	running := n.AroniumRunning()
+	// An Aronium installer migrates the database on Aronium's next start, so the
+	// triggers must be off while one runs, even if Aronium itself shows up.
+	running := n.AroniumRunning() && !n.UpdaterRunning()
+	if n.killed {
+		return nil
+	}
 	return n.Engine(func(e *rt.DB) error {
 		on := e.TriggersOn()
 		n.setStatus(func(s *Status) { s.TriggersOn = on })
@@ -600,18 +643,7 @@ func (n *Node) Run(ctx context.Context) error {
 	tick := time.NewTicker(time.Duration(n.cfg.PollMs) * time.Millisecond)
 	defer tick.Stop()
 	for {
-		if err := n.Tick(); err != nil {
-			n.log.Printf("lifecycle: %v", err)
-		}
-		if _, via, err := n.PullOnce(ctx); err != nil {
-			n.log.Printf("pull (%s): %v", via, err)
-		}
-		if time.Since(n.lastShare) > time.Minute {
-			if err := n.PublishShare(); err != nil {
-				n.log.Printf("shared folder: %v", err)
-			}
-			n.lastShare = time.Now()
-		}
+		n.Step(ctx)
 		select {
 		case <-ctx.Done():
 			return ctx.Err()

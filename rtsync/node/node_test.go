@@ -26,8 +26,8 @@ func seedFile(t *testing.T) string {
 	p := filepath.Join(t.TempDir(), "seed.db")
 	db := open(t, p)
 	defer db.Close()
-	exec(t, db, string(schema))
-	exec(t, db, `
+	execSQL(t, db, string(schema))
+	execSQL(t, db, `
 INSERT INTO Warehouse(Id,Name) VALUES(1,'Main');
 INSERT INTO User(Id,FirstName,Password,AccessLevel) VALUES(1,'Test','x',9);
 INSERT INTO DocumentCategory(Id,Name) VALUES(2,'Sales');
@@ -52,7 +52,7 @@ func open(t *testing.T, p string) *sql.DB {
 	return db
 }
 
-func exec(t *testing.T, db *sql.DB, q string, args ...any) {
+func execSQL(t *testing.T, db *sql.DB, q string, args ...any) {
 	t.Helper()
 	if _, err := db.Exec(q, args...); err != nil {
 		t.Fatalf("%v\n%s", err, q)
@@ -91,6 +91,9 @@ func pair(t *testing.T, share string) (*side, *side) {
 		}
 		n.AroniumRunning = func() bool { return true }
 		n.cfg.StableSec = 0 // New() turns 0 into the 15 s default
+		n.UpdaterRunning = func() bool { return false }
+		n.Notify = nil
+		n.cfg.Role = map[string]string{"A": "till", "B": "office"}[name]
 		s := &side{n: n, aro: open(t, p), srv: httptest.NewServer(n.Handler())}
 		t.Cleanup(func() { s.srv.Close(); s.aro.Close(); n.Close() })
 		return s
@@ -149,7 +152,7 @@ func TestLANBothWays(t *testing.T) {
 	a, b := pair(t, "")
 	sale(t, a.aro, "A1", 1, 2)
 	sale(t, b.aro, "B1", 2, 3)
-	exec(t, b.aro, "UPDATE Product SET Price=160 WHERE Id=2")
+	execSQL(t, b.aro, "UPDATE Product SET Price=160 WHERE Id=2")
 	settle()
 	ctx := context.Background()
 	if n, via, err := b.n.PullOnce(ctx); err != nil || via != "lan" || n == 0 {
@@ -243,8 +246,8 @@ func TestPartitionThenReconnectInPages(t *testing.T) {
 		sale(t, a.aro, fmt.Sprintf("A%02d", i), 1, 1)
 		sale(t, b.aro, fmt.Sprintf("B%02d", i), 1, 2)
 		if i%15 == 0 {
-			exec(t, a.aro, "UPDATE Product SET Price=Price+1 WHERE Id=1")
-			exec(t, b.aro, "UPDATE Product SET Price=Price+2 WHERE Id=2")
+			execSQL(t, a.aro, "UPDATE Product SET Price=Price+1 WHERE Id=1")
+			execSQL(t, b.aro, "UPDATE Product SET Price=Price+2 WHERE Id=2")
 		}
 	}
 	if _, _, err := b.n.PullOnce(context.Background()); err == nil {

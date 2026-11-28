@@ -3,6 +3,7 @@
 //	arsync-rt seed   -db pos.db -node A      mark a database as the common start
 //	arsync-rt run    -config rt.json         run the sidecar
 //	arsync-rt status -config rt.json         print sync state as JSON
+//	arsync-rt kill   -config rt.json [-both] turn real-time sync off (one-writer sync resumes)
 package main
 
 import (
@@ -14,6 +15,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 
 	"github.com/huenique/ar-sync/rtsync/node"
 	"github.com/huenique/ar-sync/rtsync/rt"
@@ -31,6 +33,8 @@ func main() {
 		err = run(os.Args[2:])
 	case "status":
 		err = status(os.Args[2:])
+	case "kill":
+		err = kill(os.Args[2:])
 	default:
 		usage()
 	}
@@ -41,7 +45,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: arsync-rt seed -db PATH -node NAME | run -config FILE | status -config FILE")
+	fmt.Fprintln(os.Stderr, "usage: arsync-rt seed -db PATH -node NAME | run -config FILE | status -config FILE | kill -config FILE [-both]")
 	os.Exit(2)
 }
 
@@ -126,4 +130,34 @@ func status(args []string) error {
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	return enc.Encode(out)
+}
+
+// kill drops a kill file. The running sidecar does one last exchange, removes
+// its triggers and tables from pos.db, and stays idle. With -both, the file goes
+// in the shared folder and both laptops stop.
+func kill(args []string) error {
+	fs := flag.NewFlagSet("kill", flag.ExitOnError)
+	cfgPath := fs.String("config", "", "config file")
+	both := fs.Bool("both", false, "stop both laptops (shared-folder kill file)")
+	fs.Parse(args)
+	cfg, err := loadConfig(*cfgPath)
+	if err != nil {
+		return err
+	}
+	files := node.KillPaths(cfg)
+	target := files[0]
+	if *both {
+		if len(files) < 2 {
+			return fmt.Errorf("no shared folder configured")
+		}
+		target = files[1]
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			return err
+		}
+	}
+	if err := os.WriteFile(target, []byte("real-time sync turned off\n"), 0o644); err != nil {
+		return err
+	}
+	fmt.Println("kill file written:", target)
+	return nil
 }

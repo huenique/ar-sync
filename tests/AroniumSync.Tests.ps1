@@ -682,6 +682,8 @@ Describe 'Protocol handler' {
         @{ Uri = 'aronium-sync:takeover'; Want = 'takeover' }
         @{ Uri = 'aronium-sync://takeover/'; Want = 'takeover' }
         @{ Uri = 'ARONIUM-SYNC:later'; Want = 'later' }
+        @{ Uri = 'aronium-sync:restart-aronium'; Want = 'restart-aronium' }
+        @{ Uri = 'aronium-sync:restart-later'; Want = 'restart-later' }
     ) {
         ConvertTo-SyncAction -Uri $Uri | Should -Be $Want
     }
@@ -1210,5 +1212,52 @@ Describe 'Self-update guards' {
         $x.Task.Triggers.LogonTrigger.Delay | Should -Be 'PT10M'
         $x.Task.Principals.Principal.LogonType | Should -Be 'InteractiveToken'
         $x.Task.Actions.Exec.Arguments | Should -Match 'update\.ps1'
+    }
+}
+
+Describe 'Real-time sync hooks (<Kind> DB)' -ForEach $Cases {
+    BeforeEach {
+        Initialize-Mocks
+        $L = New-TwoLaptops -Kind $Kind
+        $A = $L.A
+    }
+
+    It 'publishes a copy without the sidecar''s _rt_ tables and triggers' {
+        $sql = "CREATE TABLE _rt_meta(k TEXT PRIMARY KEY, v TEXT); INSERT INTO _rt_meta VALUES('node','A'); " +
+            "CREATE TABLE _rt_log(seq INTEGER PRIMARY KEY, tbl TEXT); " +
+            "CREATE TRIGGER _rt_Product_I AFTER INSERT ON Product BEGIN INSERT INTO _rt_log(tbl) VALUES('Product'); END;"
+        Invoke-Sqlite -Config $A -Database $A.dbPath -Sql $sql | Out-Null
+        Invoke-Publish -Config $A -Now $Now -HostName 'LAPTOP-A' | Should -Be 'published'
+        $latestDb = Join-Path $A.oneDriveFolder 'latest.db'
+        $q = "SELECT count(*) FROM sqlite_master WHERE name LIKE '\_rt\_%' ESCAPE '\';"
+        @(Invoke-Sqlite -Config $A -Database $latestDb -ReadOnly -Sql $q)[0] | Should -Be '0'
+        @(Invoke-Sqlite -Config $A -Database $A.dbPath -ReadOnly -Sql $q)[0] | Should -Be '3'
+        Test-SqliteIntegrity -Config $A -Database $latestDb | Should -BeTrue
+    }
+
+    It 'Restart now closes Aronium gracefully and reopens it' {
+        Mock Get-AroniumProcess -ModuleName AroniumSync { [pscustomobject]@{ Id = 1 } }
+        Invoke-ProtocolAction -Config $A -Uri 'aronium-sync:restart-aronium' | Should -Be 'restart-aronium'
+        Should -Invoke Close-AroniumGracefully -ModuleName AroniumSync -Times 1 -Exactly
+        Should -Invoke Start-Aronium -ModuleName AroniumSync -Times 1 -Exactly
+    }
+
+    It 'does not reopen Aronium when it will not close' {
+        Mock Get-AroniumProcess -ModuleName AroniumSync { [pscustomobject]@{ Id = 1 } }
+        Mock Close-AroniumGracefully -ModuleName AroniumSync { $false }
+        Invoke-RestartAronium -Config $A | Should -Be 'busy'
+        Should -Invoke Start-Aronium -ModuleName AroniumSync -Times 0 -Exactly
+    }
+
+    It 'Later writes the flag the sidecar reads' {
+        Invoke-ProtocolAction -Config $A -Uri 'aronium-sync:restart-later' | Should -Be 'restart-later'
+        Test-Path -LiteralPath (Get-RtLaterPath -Config $A) | Should -BeTrue
+    }
+
+    It 'the notify hook shows toasts with only the restart buttons' {
+        Invoke-RtNotify -Config $A -Kind 'prices' -Text 'x' -Buttons @('restart-aronium', 'takeover', 'restart-later') | Should -Be 'shown'
+        Should -Invoke Show-SyncToast -ModuleName AroniumSync -Times 1 -Exactly -ParameterFilter {
+            $Kind -eq 'rt-prices' -and ($Buttons -join ',') -eq 'restart-aronium,restart-later' }
+        { Invoke-RtNotify -Config $A -Kind 'bad kind;' -Text 'x' } | Should -Throw
     }
 }
