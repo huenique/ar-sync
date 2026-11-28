@@ -703,11 +703,10 @@ function Test-Divergence {
         if ($grew.Count -eq 0) { return @{ Diverged = $false; Fingerprint = $sales; Reason = 'no new sales since last restore' } }
         return @{ Diverged = $true; Fingerprint = $sales; Reason = ('new ' + ($grew -join ', ') + ' rows since last restore') }
     }
-    # No stamp: we cannot tell this laptop's sales from the seller's, so only an exact match is safe.
-    if ($Latest -and $Latest.fingerprint -and (Get-SaleFingerprint -FromFingerprint ([string]$Latest.fingerprint)) -eq $sales) {
-        return @{ Diverged = $false; Fingerprint = $sales; Reason = 'matches published copy' }
-    }
-    return @{ Diverged = $true; Fingerprint = $sales; Reason = 'no restore stamp and local sales differ from the published copy' }
+    # No stamp: there is no baseline of this laptop's own, and nothing can be learned from the
+    # seller's copy. Each laptop numbers receipts and payments by itself, so the same counts, Ids
+    # and Numbers can be completely different sales (live case 2026-11-27). Pause; a person decides.
+    return @{ Diverged = $true; Fingerprint = $sales; Reason = 'no restore stamp, so sales on this laptop cannot be ruled out' }
 }
 
 function Test-SyncPaused {

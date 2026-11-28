@@ -394,6 +394,94 @@ Describe 'Divergence check (<Kind> DB)' -ForEach $Cases {
     }
 }
 
+Describe 'Colliding Ids: the reader really sold, with the same Document and Payment Ids as the seller (<Kind> DB)' -ForEach $Cases {
+    # Live case 2026-11-27: B restored at 08:30 (Document max Id 33616), then rang 3 sales at
+    # 11:07, 11:17, 11:57 (Documents 33617-33619, Payments 38378-38380). A rang its own
+    # Documents 33617-33619 with the same Payment Ids at 08:28-09:44, different totals.
+    BeforeAll {
+        function Add-SaleWithIds {
+            param([string]$Database, [int]$DocId, [int]$PayId, [string]$When, [double]$Total)
+            $sql = @"
+BEGIN;
+INSERT INTO Document (Id, Number, UserId, Date, StockDate, Total, DocumentTypeId, WarehouseId, DateCreated, DateUpdated)
+  VALUES ($DocId, '26-200-0$DocId', (SELECT min(Id) FROM User), '$($When.Substring(0,10))', '$When', $Total, 1, 1, '$When', '$When');
+INSERT INTO DocumentItem (DocumentId, ProductId, Quantity, Price) VALUES ($DocId, (SELECT min(Id) FROM Product), 1, $Total);
+INSERT INTO Payment (Id, DocumentId, PaymentTypeId, Amount, Date) VALUES ($PayId, $DocId, 1, $Total, '$($When.Substring(0,10))');
+COMMIT;
+"@
+            Invoke-TestSql -Database $Database -Sql $sql | Out-Null
+        }
+        function Set-V102Stamp {
+            # The stamp as v1.0.2 wrote it: full fingerprint only, no "sales" baseline.
+            param($Config, [datetime]$At)
+            Save-RestoreStamp -Config $Config -Stamp ([pscustomobject]@{
+                    kind = 'restore'; sha256 = 'v102'; published_at = (Format-SyncTime $At); restored_at = (Format-SyncTime $At)
+                    fingerprint = (Get-DataFingerprint -Config $Config -Database $Config.dbPath) })
+        }
+    }
+
+    BeforeEach {
+        Initialize-Mocks
+        $L = New-TwoLaptops -Kind $Kind
+        $A = $L.A; $B = $L.B
+        # Both laptops share history up to Document 33616 / Payment 38377 (the 08:30 restore).
+        foreach ($db in @($A.dbPath, $B.dbPath)) { Add-SaleWithIds -Database $db -DocId 33616 -PayId 38377 -When '2026-11-27 08:10:00' -Total 50 }
+        Set-V102Stamp -Config $B -At ([datetime]'2026-11-27T08:30:00')
+        Get-StampSales (Get-RestoreStamp -Config $B) | Should -Match 'Document=\d+/33616;'
+        # A's own sales, same Ids.
+        Add-SaleWithIds -Database $A.dbPath -DocId 33617 -PayId 38378 -When '2026-11-27 08:28:00' -Total 120
+        Add-SaleWithIds -Database $A.dbPath -DocId 33618 -PayId 38379 -When '2026-11-27 09:05:00' -Total 75
+        Add-SaleWithIds -Database $A.dbPath -DocId 33619 -PayId 38380 -When '2026-11-27 09:44:00' -Total 310
+        # B's own sales after its restore, same Ids, different totals.
+        Add-SaleWithIds -Database $B.dbPath -DocId 33617 -PayId 38378 -When '2026-11-27 11:07:00' -Total 45
+        Add-SaleWithIds -Database $B.dbPath -DocId 33618 -PayId 38379 -When '2026-11-27 11:17:00' -Total 230
+        Add-SaleWithIds -Database $B.dbPath -DocId 33619 -PayId 38380 -When '2026-11-27 11:57:00' -Total 18
+        Invoke-Publish -Config $A -Now ([datetime]'2026-11-28T10:00:00') -HostName 'LAPTOP-A' | Should -Be 'published'
+        # The seller's published copy has the same sale counts and max Ids as B: only content differs.
+        Get-SaleFingerprint -FromFingerprint (Get-Latest $A).fingerprint | Should -Be (Get-SaleFingerprint -Config $B -Database $B.dbPath)
+        $shaBefore = Get-FileSha256 $B.dbPath
+    }
+
+    It 'KEEPS an existing pause (v1.0.2 stamp, Document max 33616 -> 33619, +3 rows)' {
+        Set-Content -LiteralPath $B.pauseFlag -Value 'paused by v1.0.2'
+        $d = Test-Divergence -Config $B -Latest (Get-Latest $A)
+        $d.Diverged | Should -BeTrue
+        $d.Reason | Should -BeLike '*Document*Payment*'
+        Invoke-Check -Config $B -Now ([datetime]'2026-11-28T10:05:00') | Should -Be 'paused'
+        Test-Path $B.pauseFlag | Should -BeTrue
+        Get-FileSha256 $B.dbPath | Should -Be $shaBefore
+    }
+
+    It 'pauses fresh (no flag yet) and leaves pos.db alone' {
+        Invoke-Check -Config $B -Now ([datetime]'2026-11-28T10:05:00') | Should -Be 'paused'
+        Test-Path $B.pauseFlag | Should -BeTrue
+        Get-FileSha256 $B.dbPath | Should -Be $shaBefore
+    }
+
+    It 'Take over keeps the reader''s own sales instead of restoring the colliding copy' {
+        Mock Show-ConfirmBox -ModuleName AroniumSync { $true }
+        Set-Content -LiteralPath $B.pauseFlag -Value 'paused'
+        Invoke-Takeover -Config $B -Now ([datetime]'2026-11-28T10:10:00') -HostName 'LAPTOP-B' | Should -Be 'taken-over'
+        [double](Get-TestScalar -Database $B.dbPath -Sql 'SELECT Total FROM Document WHERE Id = 33619;') | Should -Be 18
+        [double](Get-TestScalar -Database $B.dbPath -Sql 'SELECT Amount FROM Payment WHERE Id = 38380;') | Should -Be 18
+    }
+
+    It 'with NO restore stamp, equal counts and max Ids with the seller are NOT treated as the same sales' {
+        Remove-Item -LiteralPath (Join-Path $B.stateDir 'restore-stamp.json')
+        (Test-Divergence -Config $B -Latest (Get-Latest $A)).Diverged | Should -BeTrue
+        Invoke-Check -Config $B -Now ([datetime]'2026-11-28T10:05:00') | Should -Be 'paused'
+        Get-FileSha256 $B.dbPath | Should -Be $shaBefore
+    }
+
+    It 'with NO restore stamp, an existing pause is kept (not lifted)' {
+        Remove-Item -LiteralPath (Join-Path $B.stateDir 'restore-stamp.json')
+        Set-Content -LiteralPath $B.pauseFlag -Value 'paused by v1.0.2'
+        Invoke-Check -Config $B -Now ([datetime]'2026-11-28T10:05:00') | Should -Be 'paused'
+        Test-Path $B.pauseFlag | Should -BeTrue
+        Get-FileSha256 $B.dbPath | Should -Be $shaBefore
+    }
+}
+
 Describe 'OneDrive mid-sync (<Kind> DB)' -ForEach $Cases {
     BeforeEach {
         Initialize-Mocks
