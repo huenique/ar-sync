@@ -54,6 +54,9 @@ type Config struct {
 	LaterFile string `json:"laterFile"`
 	// OpenHour: before this local hour a pending till restart runs by itself (default 8).
 	OpenHour int `json:"openHour"`
+	// StuckSec: a peer change that keeps failing this long is set aside and
+	// reported (default 300).
+	StuckSec int `json:"stuckSec"`
 }
 
 func (c *Config) defaults() {
@@ -68,6 +71,9 @@ func (c *Config) defaults() {
 	}
 	if c.StableSec == 0 {
 		c.StableSec = 15
+	}
+	if c.StuckSec == 0 {
+		c.StuckSec = 300
 	}
 	if c.OpenHour == 0 {
 		c.OpenHour = 8
@@ -122,6 +128,10 @@ type Node struct {
 
 	lastToast map[string]time.Time
 	killed    bool
+	final     *hello // what /hello reports after sync was removed here
+	peer      hello  // the peer's last /hello (LAN or shared folder)
+	stuckSeq  int64
+	stuckFrom time.Time
 
 	client    *http.Client
 	startSeen time.Time
@@ -225,9 +235,13 @@ func (n *Node) checkRequest(r *http.Request) error {
 // ---------------------------------------------------------------- server
 
 type hello struct {
-	Node   string `json:"node"`
-	Seed   string `json:"seed"`
-	Schema string `json:"schema"`
+	Node     string `json:"node"`
+	Seed     string `json:"seed"`
+	Schema   string `json:"schema"`
+	MaxSeq   int64  `json:"maxSeq"`   // highest change seq this laptop has made
+	Aronium  bool   `json:"aronium"`  // Aronium open on this laptop
+	Draining bool   `json:"draining"` // kill switch set: finishing the last exchange
+	Killed   bool   `json:"killed"`   // real-time sync removed from this laptop
 }
 
 // Handler serves /hello and /changes to the peer.
@@ -238,12 +252,7 @@ func (n *Node) Handler() http.Handler {
 			http.Error(w, err.Error(), http.StatusUnauthorized)
 			return
 		}
-		var h hello
-		n.Engine(func(e *rt.DB) error {
-			h = hello{n.cfg.Node, e.SeedTag(), e.SchemaTag()}
-			return nil
-		})
-		n.writeSigned(w, h)
+		n.writeSigned(w, n.selfHello())
 	})
 	mux.HandleFunc("/changes", func(w http.ResponseWriter, r *http.Request) {
 		if err := n.checkRequest(r); err != nil {
@@ -255,16 +264,39 @@ func (n *Node) Handler() http.Handler {
 			http.Error(w, "bad after", http.StatusBadRequest)
 			return
 		}
+		if f := n.final; f != nil {
+			// Sync was removed here after a full exchange: nothing more to send.
+			if after > f.MaxSeq {
+				http.Error(w, "asked past this laptop's last change", http.StatusConflict)
+				return
+			}
+			n.writeSigned(w, &rt.Batch{Origin: f.Node, SeedTag: f.Seed, Schema: f.Schema, From: after + 1, To: after})
+			return
+		}
 		var b *rt.Batch
+		rewound := false
 		err = n.Engine(func(e *rt.DB) error {
+			max, err := e.LogMaxSeq()
+			if err != nil {
+				return err
+			}
+			if after > max {
+				rewound = true // this pos.db is older than what the peer already has
+				return nil
+			}
 			// The peer asking for after=N has applied everything up to N.
-			e.SetMeta("ack."+n.cfg.Peer, strconv.FormatInt(after, 10))
-			var err error
+			if v, _ := e.GetMeta("ack." + n.cfg.Peer); v != strconv.FormatInt(after, 10) {
+				e.SetMeta("ack."+n.cfg.Peer, strconv.FormatInt(after, 10))
+			}
 			b, err = e.ExtractSettled(after, n.cfg.PageSize, n.cfg.SettleMs)
 			return err
 		})
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if rewound {
+			http.Error(w, "asked past this laptop's last change", http.StatusConflict)
 			return
 		}
 		n.writeSigned(w, b)
@@ -299,6 +331,9 @@ func (n *Node) get(ctx context.Context, base, path string, v any) error {
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
 	if err != nil {
 		return err
+	}
+	if resp.StatusCode == http.StatusConflict {
+		return fmt.Errorf("%s: %w", base, ErrRewound)
 	}
 	if resp.StatusCode != 200 {
 		return fmt.Errorf("%s: %s %s", base, resp.Status, strings.TrimSpace(string(body)))
@@ -361,7 +396,7 @@ func (n *Node) PullOnce(ctx context.Context) (applied int, via string, err error
 		if err == nil {
 			return applied, "lan", nil
 		}
-		if errors.Is(err, rt.ErrMismatch) {
+		if errors.Is(err, rt.ErrMismatch) || errors.Is(err, ErrRewound) {
 			return applied, "lan", err
 		}
 		lanErr = err
@@ -381,6 +416,13 @@ func (n *Node) PullOnce(ctx context.Context) (applied int, via string, err error
 }
 
 func (n *Node) pullFrom(ctx context.Context, base string) (int, error) {
+	var h hello
+	if err := n.get(ctx, base, "/hello", &h); err != nil {
+		return 0, err
+	}
+	if err := n.notePeer(h); err != nil {
+		return 0, err
+	}
 	total := 0
 	for page := 0; page < 10000; page++ {
 		var last int64
@@ -412,6 +454,7 @@ func (n *Node) apply(b *rt.Batch) (int, error) {
 		a, err = e.Apply(b)
 		return err
 	})
+	n.checkStuck(err)
 	if a > 0 {
 		n.log.Printf("applied %d changes from %s (seq %d..%d)", a, b.Origin, b.From, b.To)
 		tables := map[string]int{}
@@ -442,6 +485,7 @@ type segFile struct {
 type ackFile struct {
 	Node    string `json:"node"`
 	Applied int64  `json:"applied"` // last seq of the peer applied here
+	Hello   hello  `json:"hello"`   // the same facts /hello gives over the LAN
 }
 
 func (n *Node) shareDir() string { return filepath.Join(n.cfg.ShareDir, "rt") }
@@ -471,7 +515,7 @@ func (n *Node) PublishShare() error {
 	}
 	return n.Engine(func(e *rt.DB) error {
 		peerApplied, _ := e.LastSeq(n.cfg.Peer)
-		raw, _ := json.Marshal(ackFile{n.cfg.Node, peerApplied})
+		raw, _ := json.Marshal(ackFile{n.cfg.Node, peerApplied, n.helloLocked(e)})
 		if err := writeAtomic(filepath.Join(dir, "ack-"+n.cfg.Node+".json"), raw); err != nil {
 			return err
 		}
@@ -548,6 +592,12 @@ func listSegs(dir, node string) []segRef {
 // ReadShare applies the peer's segment files from the shared folder, in order.
 func (n *Node) ReadShare() (int, error) {
 	dir := n.shareDir()
+	var af ackFile
+	if raw, err := os.ReadFile(filepath.Join(dir, "ack-"+n.cfg.Peer+".json")); err == nil && json.Unmarshal(raw, &af) == nil && af.Hello.Node == n.cfg.Peer {
+		if err := n.notePeer(af.Hello); err != nil {
+			return 0, err
+		}
+	}
 	total := 0
 	for _, s := range listSegs(dir, n.cfg.Peer) {
 		var last int64
@@ -589,7 +639,9 @@ func (n *Node) ReadShare() (int, error) {
 func (n *Node) Tick() error {
 	// An Aronium installer migrates the database on Aronium's next start, so the
 	// triggers must be off while one runs, even if Aronium itself shows up.
-	running := n.AroniumRunning() && !n.UpdaterRunning()
+	// While draining for the kill switch, triggers stay on with Aronium closed so
+	// the last exchange can still be applied.
+	running := (n.AroniumRunning() || n.draining()) && !n.UpdaterRunning()
 	if n.killed {
 		return nil
 	}

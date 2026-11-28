@@ -167,27 +167,102 @@ func TestUpdaterTurnsTriggersOff(t *testing.T) {
 	}
 }
 
-func TestKillSwitch(t *testing.T) {
+func TestKillSwitchDrainsBeforeRemoving(t *testing.T) {
 	share := t.TempDir()
 	a, b := pair(t, share)
 	ctx := context.Background()
-	sale(t, b.aro, "B-last", 1, 1)
+	openA, openB := true, true
+	a.n.AroniumRunning = func() bool { return openA }
+	b.n.AroniumRunning = func() bool { return openB }
+	sale(t, b.aro, "B-before-kill", 1, 1)
 	settle()
 	os.MkdirAll(filepath.Join(share, "rt"), 0o755)
 	os.WriteFile(filepath.Join(share, "rt", "KILL"), nil, 0o644)
-	a.n.Step(ctx) // final exchange, then off
-	if !a.n.Status().Killed {
-		t.Fatal("not killed")
+	a.n.Step(ctx)
+	b.n.Step(ctx)
+	if a.n.Status().Killed || b.n.Status().Killed {
+		t.Fatal("removed while Aronium was still open")
 	}
-	if n := scalar(t, a.aro, "SELECT count(*) FROM Document WHERE Number='B-last'"); n != "1" {
-		t.Fatal("final exchange did not bring the office's last sale")
+	// A last sale on each laptop, then Aronium closes on both.
+	sale(t, a.aro, "A-last", 2, 1)
+	sale(t, b.aro, "B-last", 1, 1)
+	openA, openB = false, false
+	settle()
+	for i := 0; i < 6 && !(a.n.Status().Killed && b.n.Status().Killed); i++ {
+		a.n.Step(ctx)
+		b.n.Step(ctx)
+		settle()
 	}
-	if n := scalar(t, a.aro, `SELECT count(*) FROM sqlite_master WHERE name LIKE '\_rt\_%' ESCAPE '\'`); n != "0" {
-		t.Fatalf("%s sync tables/triggers left in pos.db", n)
+	if !a.n.Status().Killed || !b.n.Status().Killed {
+		t.Fatalf("not both removed: A %+v / B %+v", a.n.Status(), b.n.Status())
 	}
-	// Further steps do nothing and never bring triggers back.
+	for _, s := range []*side{a, b} {
+		for _, num := range []string{"B-before-kill", "A-last", "B-last"} {
+			if n := scalar(t, s.aro, "SELECT count(*) FROM Document WHERE Number='"+num+"'"); n != "1" {
+				t.Fatalf("%s missing %s after the drain", s.n.cfg.Node, num)
+			}
+		}
+		if n := scalar(t, s.aro, `SELECT count(*) FROM sqlite_master WHERE name LIKE '\_rt\_%' ESCAPE '\'`); n != "0" {
+			t.Fatalf("%s: %s sync tables/triggers left", s.n.cfg.Node, n)
+		}
+	}
+	if sa, sb := state(t, a.aro), state(t, b.aro); sa != sb {
+		t.Fatalf("differ after drain:\nA %s\nB %s", sa, sb)
+	}
 	a.n.Step(ctx)
 	if n := scalar(t, a.aro, `SELECT count(*) FROM sqlite_master WHERE type='trigger'`); n != "0" {
 		t.Fatal("triggers came back after kill")
+	}
+}
+
+func TestRestoredDatabaseStopsSync(t *testing.T) {
+	a, b := pair(t, "")
+	var seen notices
+	a.n.Notify = seen.fn
+	ctx := context.Background()
+	sale(t, b.aro, "B1", 1, 1)
+	sale(t, b.aro, "B2", 1, 1)
+	settle()
+	a.n.Step(ctx) // A has applied B's changes
+	// B's pos.db is put back to an older copy: its change log rewinds.
+	execSQL(t, b.aro, "UPDATE sqlite_sequence SET seq=1 WHERE name='_rt_log'")
+	execSQL(t, b.aro, "DELETE FROM _rt_log WHERE seq > 1")
+	a.n.Step(ctx)
+	if seen.count("rewound") != 1 || a.n.Status().Paused == "" {
+		t.Fatalf("restore not detected: %+v %v", a.n.Status(), seen.got)
+	}
+	var seenB notices
+	b.n.Notify = seenB.fn
+	b.n.Step(ctx)
+	if seenB.count("rewound") != 1 {
+		t.Fatal("restored laptop did not notice itself")
+	}
+}
+
+func TestStuckChangeIsSetAsideAndReported(t *testing.T) {
+	a, b := pair(t, "")
+	var seen notices
+	clk := &clock{time.Now()}
+	a.n.Notify, a.n.Now = seen.fn, clk.now
+	ctx := context.Background()
+	// A receipt line for a product A never heard of and never deleted: it can't apply.
+	execSQL(t, b.aro, "INSERT INTO Product(Name,Code,Price) VALUES('Ghost','G',1)")
+	sale(t, b.aro, "B1", 1, 1)
+	settle()
+	// Make A's copy unable to take the product insert: same unique code is fine,
+	// so break it with a trigger that rejects it.
+	execSQL(t, a.aro, "CREATE TRIGGER reject_ghost BEFORE INSERT ON Product WHEN NEW.Name='Ghost' BEGIN SELECT RAISE(ABORT,'test: rejected'); END")
+	a.n.Step(ctx)
+	if a.n.Status().LastError == "" {
+		t.Fatal("expected a failing change")
+	}
+	clk.t = clk.t.Add(6 * time.Minute)
+	a.n.Step(ctx) // same change still failing: set aside and report
+	a.n.Step(ctx) // next pass gets past it
+	if seen.count("stuck") != 1 {
+		t.Fatalf("stuck notices = %d, want 1", seen.count("stuck"))
+	}
+	if n := scalar(t, a.aro, "SELECT count(*) FROM Document WHERE Number='B1'"); n != "1" {
+		t.Fatal("changes after the stuck one did not arrive")
 	}
 }

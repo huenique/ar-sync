@@ -32,8 +32,9 @@ type TableSpec struct {
 	// LocalCols never travel: they hold per-till state (Z report membership).
 	LocalCols []string
 	// SoftDelete: a delete from the peer becomes IsEnabled=0 here. Used for
-	// Product: Aronium's selling screen caches the product list until restart,
-	// and a hard delete would make the cached product fail at the counter.
+	// rows sales point at (Product, Customer, PaymentType, User): a sale rung
+	// here before the delete arrived must keep its parent, and Aronium's selling
+	// screen caches products until it restarts.
 	SoftDelete bool
 }
 
@@ -43,12 +44,12 @@ type TableSpec struct {
 // PosOrder/PosOrderItem/PosVoid, FloorPlan*, FiscalItem, Company, Template,
 // DocumentCategory, DocumentType.
 var Replicated = []TableSpec{
-	{Name: "User", Kind: KindID},
+	{Name: "User", Kind: KindID, SoftDelete: true},
 	{Name: "Country", Kind: KindID},
 	{Name: "Currency", Kind: KindID},
 	{Name: "Warehouse", Kind: KindID},
 	{Name: "Tax", Kind: KindID},
-	{Name: "PaymentType", Kind: KindID},
+	{Name: "PaymentType", Kind: KindID, SoftDelete: true},
 	{Name: "VoidReason", Kind: KindID},
 	{Name: "ProductGroup", Kind: KindID},
 	{Name: "PriceList", Kind: KindID},
@@ -59,7 +60,7 @@ var Replicated = []TableSpec{
 	{Name: "PriceListItem", Kind: KindID},
 	{Name: "Promotion", Kind: KindID},
 	{Name: "PromotionItem", Kind: KindID},
-	{Name: "Customer", Kind: KindID},
+	{Name: "Customer", Kind: KindID, SoftDelete: true},
 	{Name: "CustomerDiscount", Kind: KindID},
 	{Name: "LoyaltyCard", Kind: KindID},
 	{Name: "StockControl", Kind: KindID},
@@ -88,4 +89,14 @@ func (s *TableSpec) isLocalCol(c string) bool {
 		}
 	}
 	return false
+}
+
+// partOf: child tables whose rows belong to one parent row and go with it when
+// it is deleted (Aronium cascades these, and so does the sync).
+var partOf = map[string]string{
+	"DocumentItem": "Document", "Payment": "Document",
+	"DocumentItemTax": "DocumentItem", "DocumentItemExpirationDate": "DocumentItem",
+	"PromotionItem": "Promotion", "PriceListItem": "PriceList",
+	"Barcode": "Product", "ProductTax": "Product", "ProductComment": "Product", "StockControl": "Product",
+	"CustomerDiscount": "Customer", "LoyaltyCard": "Customer",
 }

@@ -38,15 +38,23 @@ func (d *DB) ExtractSettled(since int64, limit int, settleMs int64) (*Batch, err
 		return nil, err
 	}
 	tag, _, _ := d.getMeta("seed_tag")
-	if err := d.begin(false); err != nil {
+	// Only open a write transaction when there is something to stamp: the
+	// peer asks every 1.5 s all day, and the till's disk shouldn't notice.
+	var pending int
+	if err := d.one("SELECT EXISTS(SELECT 1 FROM _rt_log WHERE hlc IS NULL)").Scan(&pending); err != nil {
 		return nil, err
 	}
-	if err := d.stamp(); err != nil {
-		d.rollback()
-		return nil, err
-	}
-	if err := d.commit(); err != nil {
-		return nil, err
+	if pending == 1 {
+		if err := d.begin(false); err != nil {
+			return nil, err
+		}
+		if err := d.stamp(); err != nil {
+			d.rollback()
+			return nil, err
+		}
+		if err := d.commit(); err != nil {
+			return nil, err
+		}
 	}
 	b := &Batch{Origin: node, SeedTag: tag, Schema: d.SchemaTag(), From: since + 1, To: since}
 	cutoff := int64(1) << 62

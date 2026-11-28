@@ -18,6 +18,8 @@ type DB struct {
 	conn *sql.Conn
 	ctx  context.Context
 	sch  map[string]*tableInfo
+	// setAside: per origin, a seq the sidecar gave up on after it kept failing.
+	setAside map[string]int64
 }
 
 type fkInfo struct{ Col, Parent string }
@@ -30,6 +32,7 @@ type tableInfo struct {
 	FKMap   map[string]string
 	HasCol  map[string]bool
 	HasDate bool // has DateUpdated
+	NotNull map[string]bool
 }
 
 // Open opens pos.db with foreign keys on (as Aronium does) and a 5 s busy
@@ -84,8 +87,8 @@ func (d *DB) loadSchema() error {
 	d.sch = map[string]*tableInfo{}
 	for i := range Replicated {
 		sp := &Replicated[i]
-		ti := &tableInfo{Spec: sp, FKMap: map[string]string{}, HasCol: map[string]bool{}}
-		rows, err := d.query("SELECT name, pk FROM pragma_table_info(?) ORDER BY cid", sp.Name)
+		ti := &tableInfo{Spec: sp, FKMap: map[string]string{}, HasCol: map[string]bool{}, NotNull: map[string]bool{}}
+		rows, err := d.query(`SELECT name, pk, "notnull" FROM pragma_table_info(?) ORDER BY cid`, sp.Name)
 		if err != nil {
 			return err
 		}
@@ -96,13 +99,14 @@ func (d *DB) loadSchema() error {
 		var pks []pkc
 		for rows.Next() {
 			var n string
-			var pk int
-			if err := rows.Scan(&n, &pk); err != nil {
+			var pk, nn int
+			if err := rows.Scan(&n, &pk, &nn); err != nil {
 				rows.Close()
 				return err
 			}
 			ti.Cols = append(ti.Cols, n)
 			ti.HasCol[n] = true
+			ti.NotNull[n] = nn == 1
 			if pk > 0 {
 				pks = append(pks, pkc{n, pk})
 			}

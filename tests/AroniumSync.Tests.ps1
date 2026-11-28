@@ -1260,4 +1260,11 @@ Describe 'Real-time sync hooks (<Kind> DB)' -ForEach $Cases {
             $Kind -eq 'rt-prices' -and ($Buttons -join ',') -eq 'restart-aronium,restart-later' }
         { Invoke-RtNotify -Config $A -Kind 'bad kind;' -Text 'x' } | Should -Throw
     }
+
+    It 'after real-time sync is turned off, the viewing laptop takes its data as the new baseline' {
+        $B = $L.B
+        Add-TestSale -Database $B.dbPath
+        Invoke-RtNotify -Config $B -Kind 'rebaseline' | Should -Be 'rebaselined'
+        (Test-Divergence -Config $B -Latest $null).Diverged | Should -BeFalse
+    }
 }

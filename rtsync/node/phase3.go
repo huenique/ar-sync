@@ -15,10 +15,11 @@ import (
 )
 
 // catalogTables are cached by Aronium's selling screen until it restarts.
+// Only product and price caching was observed (check V2); customers and
+// payment types are not on this list until that is tested.
 var catalogTables = map[string]bool{
 	"Product": true, "Barcode": true, "ProductGroup": true, "PriceList": true, "PriceListItem": true,
-	"ProductTax": true, "Tax": true, "Promotion": true, "PromotionItem": true, "PaymentType": true,
-	"Customer": true, "CustomerDiscount": true, "LoyaltyCard": true,
+	"ProductTax": true, "Tax": true, "Promotion": true, "PromotionItem": true,
 }
 
 const (
@@ -37,13 +38,22 @@ func (n *Node) Step(ctx context.Context) {
 	if err := n.Tick(); err != nil {
 		n.log.Printf("lifecycle: %v", err)
 	}
+	if n.selfRewound() {
+		n.setStatus(func(s *Status) { s.Paused = "this laptop's database was restored from an older copy" })
+		n.toast("rewound", msgRewound, retoastEvery)
+		return
+	}
 	if _, via, err := n.PullOnce(ctx); err != nil {
 		n.log.Printf("pull (%s): %v", via, err)
-		if errors.Is(err, rt.ErrMismatch) {
+		switch {
+		case errors.Is(err, rt.ErrMismatch):
 			n.setStatus(func(s *Status) { s.Paused = "Aronium versions differ" })
 			n.toast("paused", msgPaused, retoastEvery)
+		case errors.Is(err, ErrRewound):
+			n.setStatus(func(s *Status) { s.Paused = "the other laptop's database was restored from an older copy" })
+			n.toast("rewound", msgRewound, retoastEvery)
 		}
-	} else {
+	} else if !n.draining() {
 		n.setStatus(func(s *Status) { s.Paused = "" })
 	}
 	if n.cfg.Role == "till" {
@@ -215,39 +225,4 @@ func KillPaths(c Config) []string {
 		out = append(out, filepath.Join(c.ShareDir, "rt", "KILL"))
 	}
 	return out
-}
-
-// checkKill: on a kill file, do one last exchange, then take the sync tables
-// and triggers out of pos.db so ar-sync's one-writer copies are clean, and
-// stay idle. Coming back means seeding both laptops again.
-func (n *Node) checkKill() bool {
-	if n.killed {
-		return true
-	}
-	found := ""
-	for _, f := range n.KillFiles() {
-		if _, err := os.Stat(f); err == nil {
-			found = f
-		}
-	}
-	if found == "" {
-		return false
-	}
-	n.log.Printf("kill switch %s: final exchange, then real-time sync off", found)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	if _, via, err := n.PullOnce(ctx); err != nil {
-		n.log.Printf("final pull (%s): %v", via, err)
-	}
-	if err := n.PublishShare(); err != nil {
-		n.log.Printf("final share: %v", err)
-	}
-	if err := n.Engine(func(e *rt.DB) error { return e.Uninstall() }); err != nil {
-		n.log.Printf("uninstall: %v", err)
-		return true // try again next pass
-	}
-	n.killed = true
-	n.setStatus(func(s *Status) { s.Killed = true; s.TriggersOn = false })
-	n.toast("killed", msgKilled, 0)
-	return true
 }

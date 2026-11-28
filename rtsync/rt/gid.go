@@ -180,5 +180,11 @@ func (d *DB) Seed(node string) (string, error) {
 			return "", err
 		}
 	}
+	// Snapshot now, so anything Aronium writes before the triggers first go on
+	// is caught up by InstallTriggers.
+	if err := d.takeSnapshot(); err != nil {
+		d.rollback()
+		return "", err
+	}
 	return tag, d.commit()
 }

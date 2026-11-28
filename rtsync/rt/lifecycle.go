@@ -322,3 +322,14 @@ func (d *DB) Uninstall() error {
 	_, err = d.exec("COMMIT")
 	return err
 }
+
+// LogMaxSeq is the highest seq this laptop ever gave a change. It only grows,
+// unless pos.db was restored from an older copy.
+func (d *DB) LogMaxSeq() (int64, error) {
+	var n sql.NullInt64
+	err := d.one("SELECT seq FROM sqlite_sequence WHERE name='_rt_log'").Scan(&n)
+	if err == sql.ErrNoRows {
+		return 0, nil
+	}
+	return n.Int64, err
+}

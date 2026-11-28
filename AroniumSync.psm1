@@ -457,6 +457,13 @@ function Invoke-RtNotify {
         [string[]]$Buttons = @()
     )
     if ($Kind -eq 'restart') { return (Invoke-RestartAronium -Config $Config) }
+    if ($Kind -eq 'rebaseline') {
+        # Real-time sync was turned off after a full exchange: this laptop's pos.db now holds the
+        # other laptop's sales too. Take it as the new baseline so it isn't paused as "sold here".
+        Set-BaselineStamp -Config $Config
+        Write-SyncLog -Config $Config -Message 'Real-time sync off: restore baseline reset to the current data.'
+        return 'rebaselined'
+    }
     if ($Text.Length -gt 300) { $Text = $Text.Substring(0, 300) }
     $ok = @($Buttons | Where-Object { $_ -in @('restart-aronium', 'restart-later') })
     Show-SyncToast -Config $Config -Kind ('rt-' + $Kind) -Text $Text -Buttons $ok -Persistent:($Kind -in @('paused', 'killed'))

@@ -49,6 +49,9 @@ func (d *DB) Apply(b *Batch) (applied int, err error) {
 	if b.Origin == node {
 		return 0, fmt.Errorf("batch is from this laptop (%s)", node)
 	}
+	if last, err := d.LastSeq(b.Origin); err != nil || b.To <= last {
+		return 0, err // nothing new: no write transaction
+	}
 	if err := d.begin(true); err != nil {
 		return 0, err
 	}
@@ -76,8 +79,28 @@ func (d *DB) Apply(b *Batch) (applied int, err error) {
 		if c.Seq <= last {
 			continue
 		}
-		if err = d.applyOne(b.Origin, c); err != nil {
-			return applied, fmt.Errorf("seq %d %s %s %s: %w", c.Seq, c.Op, c.Table, c.GID, err)
+		if d.setAside[b.Origin] == c.Seq {
+			d.conflict(c.Table, c.GID, fmt.Sprintf("seq %d %s from %s set aside after repeated failures", c.Seq, c.Op, b.Origin))
+			delete(d.setAside, b.Origin)
+			continue
+		}
+		// Each change in its own savepoint, so a failed one can be retried a
+		// different way (or reported) without losing the rest of the batch.
+		if _, err = d.exec("SAVEPOINT rtc"); err != nil {
+			return applied, err
+		}
+		if aerr := d.applyOne(b.Origin, c); aerr != nil {
+			d.exec("ROLLBACK TO rtc")
+			d.exec("RELEASE rtc")
+			if d.recoverChange(b.Origin, c, aerr) {
+				applied++
+				continue
+			}
+			err = &ApplyError{Origin: b.Origin, Seq: c.Seq, Err: fmt.Errorf("seq %d %s %s %s: %w", c.Seq, c.Op, c.Table, c.GID, aerr)}
+			return applied, err
+		}
+		if _, err = d.exec("RELEASE rtc"); err != nil {
+			return applied, err
 		}
 		applied++
 	}
@@ -220,9 +243,16 @@ func (d *DB) applyInsert(ti *tableInfo, origin string, c *Change) error {
 			return err
 		}
 		if skip {
-			// A parent was deleted here: this row can't exist. Remember it as deleted.
-			_, err := d.exec("INSERT OR IGNORE INTO _rt_tomb(tbl,gid,hlc,node) VALUES(?,?,?,?)", c.Table, c.GID, c.HLC, origin)
-			return err
+			if !ti.NotNull[col] {
+				// e.g. a sale to a customer deleted here: the sale still lands, without the customer.
+				d.conflict(c.Table, c.GID, col+" pointed at a row deleted here; left empty")
+				lv = nil
+			} else {
+				// A required parent was deleted here (a receipt line whose receipt was
+				// deleted): this row can't exist. Remember it as deleted.
+				_, err := d.exec("INSERT OR IGNORE INTO _rt_tomb(tbl,gid,hlc,node) VALUES(?,?,?,?)", c.Table, c.GID, c.HLC, origin)
+				return err
+			}
 		}
 		cols = append(cols, qi(col))
 		marks = append(marks, "?")
@@ -304,6 +334,32 @@ func (d *DB) applyDelete(ti *tableInfo, origin string, c *Change) error {
 		_, err = d.exec("UPDATE "+qi(ti.Spec.Name)+" SET IsEnabled=0 WHERE "+where.sql, where.args...)
 		return err
 	}
+	// Aronium cascades some deletes to rows that are not part of the deleted row
+	// (deleting a product group deletes its products). If rows here still use it,
+	// keep it: the peer did not delete those rows, and a cascade here would not
+	// be logged.
+	if ti.Spec.Kind == KindID {
+		lid := where.args[0]
+		for _, child := range Replicated {
+			cti := d.sch[child.Name]
+			if cti == nil || partOf[child.Name] == ti.Spec.Name {
+				continue
+			}
+			for _, fk := range cti.FKs {
+				if fk.Parent != ti.Spec.Name {
+					continue
+				}
+				var n int
+				if err := d.one("SELECT count(*) FROM "+qi(child.Name)+" WHERE "+qi(fk.Col)+"=?", lid).Scan(&n); err != nil {
+					return err
+				}
+				if n > 0 {
+					d.conflict(c.Table, c.GID, fmt.Sprintf("delete from %s not applied: %d %s rows here still use it", origin, n, child.Name))
+					return nil
+				}
+			}
+		}
+	}
 	_, err = d.exec("DELETE FROM "+qi(ti.Spec.Name)+" WHERE "+where.sql, where.args...)
 	return err
 }
@@ -329,4 +385,102 @@ func (d *DB) applyStock(ti *tableInfo, c *Change) error {
 		_, err = d.exec("INSERT INTO Stock(ProductId,WarehouseId,Quantity) VALUES(?,?,?)", keys[0], keys[1], c.Delta)
 	}
 	return err
+}
+
+// ApplyError says which change of a batch failed; the sidecar uses it to set a
+// change aside when it keeps failing.
+type ApplyError struct {
+	Origin string
+	Seq    int64
+	Err    error
+}
+
+func (e *ApplyError) Error() string { return e.Err.Error() }
+func (e *ApplyError) Unwrap() error { return e.Err }
+
+// SetAside makes the next Apply from origin skip seq (recorded in _rt_conflict).
+func (d *DB) SetAside(origin string, seq int64) {
+	if d.setAside == nil {
+		d.setAside = map[string]int64{}
+	}
+	d.setAside[origin] = seq
+}
+
+// Conflicts returns the notes recorded so far (newest first, at most n).
+func (d *DB) Conflicts(n int) ([]string, error) {
+	rows, err := d.query("SELECT tbl || ' ' || gid || ': ' || note FROM _rt_conflict ORDER BY rowid DESC LIMIT ?", n)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var s string
+		rows.Scan(&s)
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
+// recoverChange handles constraint failures that have a safe outcome.
+func (d *DB) recoverChange(origin string, c *Change, err error) bool {
+	msg := err.Error()
+	ti := d.sch[c.Table]
+	switch {
+	case c.Op == "D" && strings.Contains(msg, "FOREIGN KEY constraint failed"):
+		// Other rows here still use it (e.g. products in a deleted group): keep it.
+		d.conflict(c.Table, c.GID, "delete from "+origin+" not applied: rows here still use it")
+		return true
+	case c.Op == "I" && strings.Contains(msg, "UNIQUE constraint failed"):
+		ok, merr := d.mergeUnique(ti, origin, c, msg)
+		return ok && merr == nil
+	}
+	return false
+}
+
+// mergeUnique: both laptops created a row with the same unique value (e.g. a
+// StockControl row for the same product). Treat the incoming row as an edit of
+// the one already here.
+func (d *DB) mergeUnique(ti *tableInfo, origin string, c *Change, msg string) (bool, error) {
+	i := strings.Index(msg, "UNIQUE constraint failed: ")
+	if i < 0 {
+		return false, nil
+	}
+	spec := msg[i+len("UNIQUE constraint failed: "):]
+	if j := strings.IndexAny(spec, "()\n"); j >= 0 {
+		spec = spec[:j]
+	}
+	var where []string
+	var args []any
+	for _, part := range strings.Split(spec, ",") {
+		part = strings.TrimSpace(part)
+		col := part[strings.LastIndexByte(part, '.')+1:]
+		v, ok := c.Vals[col]
+		if !ok {
+			return false, nil
+		}
+		lv, skip, err := d.localValue(ti, col, v)
+		if err != nil || skip {
+			return false, err
+		}
+		where = append(where, qi(col)+" IS ?")
+		args = append(args, lv)
+	}
+	if len(where) == 0 {
+		return false, nil
+	}
+	var rid int64
+	if err := d.one("SELECT rowid FROM "+qi(ti.Spec.Name)+" WHERE "+strings.Join(where, " AND "), args...).Scan(&rid); err != nil {
+		return false, nil
+	}
+	if ti.Spec.Kind == KindID {
+		if _, err := d.exec("INSERT OR IGNORE INTO _rt_map(tbl,gid,lid) VALUES(?,?,?)", c.Table, c.GID, rid); err != nil {
+			return false, err
+		}
+	}
+	if err := d.applyUpdate(ti, origin, c, rowRef{"rowid=?", []any{rid}}); err != nil {
+		return false, err
+	}
+	d.conflict(c.Table, c.GID, "same "+spec+" as a row here: merged into it")
+	return true, nil
 }
