@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.0.4
+
+- **Fix (could lose sales):** a viewing laptop with no restore stamp is now always paused.
+  - Before this, v1.0.3 compared its receipt and payment counts and highest Ids with the selling laptop's copy. If they matched, it lifted the pause and restored, which overwrote the viewing laptop's own sales.
+  - Each laptop numbers receipts and payments on its own, so the same Ids and Numbers can be different sales. Seen live on 2026-11-27: both laptops had Documents 33617-33619 with different totals.
+  - Laptops that have a stamp, which is every normal install, weren't affected. They're compared only with their own baseline.
+
 ## v1.0.3
 
 - **Fix:** the viewing laptop no longer pauses sync when nobody sold anything on it.
