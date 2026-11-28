@@ -15,3 +15,6 @@ sync.log
 state/
 backups/
 testresults/
+
+# rtsync build output
+rtsync/*.exe
