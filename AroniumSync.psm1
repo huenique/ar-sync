@@ -624,32 +624,90 @@ function Remove-OldHistory {
 
 # ---------------------------------------------------------------- divergence (reader)
 
+# Only rows that ARE a sale count as "sales made here". Shifts (StartingCash), Z reports, stock
+# recounts and DateUpdated churn on products or customers happen when Aronium is merely open on
+# the viewing laptop; counting them paused sync for days with no sale to protect (v1.0.2).
+$script:SaleTables = @('Document', 'DocumentItem', 'Payment')
+
+function Get-SaleFingerprint {
+    # "Document=<count>/<max Id>;DocumentItem=...;Payment=..." from a database, or from a full
+    # fingerprint string (Get-DataFingerprint, as stored by v1.0.2 and earlier).
+    param([hashtable]$Config, [string]$Database, [string]$FromFingerprint)
+    $full = $(if ($FromFingerprint) { $FromFingerprint } else { Get-DataFingerprint -Config $Config -Database $Database })
+    $map = @{}
+    foreach ($part in ($full -split ';')) {
+        $k, $v = $part.Split('=', 2)
+        if ($script:SaleTables -contains $k) {
+            $f = @($v.Split('/'))
+            $map[$k] = '{0}/{1}' -f $f[0], $(if ($f.Count -gt 1 -and $f[1] -ne '') { $f[1] } else { '0' })
+        }
+    }
+    return (($script:SaleTables | ForEach-Object { '{0}={1}' -f $_, $(if ($map.ContainsKey($_)) { $map[$_] } else { 'missing' }) }) -join ';')
+}
+
+function Get-NewSaleTables {
+    # Sale tables that have more rows, or a higher max Id, now than in the baseline.
+    param([Parameter(Mandatory)][string]$Baseline, [Parameter(Mandatory)][string]$Current)
+    $parse = {
+        param($s)
+        $h = @{}
+        foreach ($part in ($s -split ';')) {
+            $k, $v = $part.Split('=', 2)
+            if ($v -match '^(\d+)/(\d+)$') { $h[$k] = @([int64]$Matches[1], [int64]$Matches[2]) }
+        }
+        $h
+    }
+    $b = & $parse $Baseline
+    $c = & $parse $Current
+    $grew = @()
+    foreach ($t in $script:SaleTables) {
+        if (-not $c.ContainsKey($t) -or -not $b.ContainsKey($t)) { continue }
+        if ($c[$t][0] -gt $b[$t][0] -or $c[$t][1] -gt $b[$t][1]) { $grew += $t }
+    }
+    return $grew
+}
+
+function Get-StampSales {
+    # Sale baseline of a restore stamp; derived from the full fingerprint for stamps from v1.0.2 and earlier.
+    param($Stamp)
+    if (-not $Stamp) { return $null }
+    if ($Stamp.PSObject.Properties.Name -contains 'sales' -and $Stamp.sales) { return [string]$Stamp.sales }
+    if ($Stamp.fingerprint) { return (Get-SaleFingerprint -FromFingerprint ([string]$Stamp.fingerprint)) }
+    return $null
+}
+
 function Set-BaselineStamp {
     # Used at install on the reader: "whatever is in pos.db now is not local sales".
     param([Parameter(Mandatory)][hashtable]$Config, [datetime]$Now = (Get-Date))
     if (-not (Test-Path -LiteralPath $Config.dbPath)) { return }
+    $fp = Get-DataFingerprint -Config $Config -Database $Config.dbPath
     Save-RestoreStamp -Config $Config -Stamp ([pscustomobject]@{
             kind        = 'baseline'
             sha256      = $null
             published_at = $null
             restored_at = (Format-SyncTime $Now)
-            fingerprint = (Get-DataFingerprint -Config $Config -Database $Config.dbPath)
+            fingerprint = $fp
+            sales       = (Get-SaleFingerprint -FromFingerprint $fp)
         })
 }
 
 function Test-Divergence {
-    # Returns @{ Diverged = bool; Fingerprint = local fingerprint; Reason = text }.
+    # Were sales rung up on this laptop since its last restore (or install)? Only new Document,
+    # DocumentItem or Payment rows count. Returns @{ Diverged; Fingerprint (sale fingerprint); Reason }.
     param([Parameter(Mandatory)][hashtable]$Config, $Latest)
     if (-not (Test-Path -LiteralPath $Config.dbPath)) { return @{ Diverged = $false; Fingerprint = $null; Reason = 'no local database' } }
-    $fp = Get-DataFingerprint -Config $Config -Database $Config.dbPath
-    $stamp = Get-RestoreStamp -Config $Config
-    if ($stamp -and $stamp.fingerprint) {
-        if ($stamp.fingerprint -eq $fp) { return @{ Diverged = $false; Fingerprint = $fp; Reason = 'matches last restore' } }
-        return @{ Diverged = $true; Fingerprint = $fp; Reason = 'local data changed since last restore' }
+    $sales = Get-SaleFingerprint -Config $Config -Database $Config.dbPath
+    $base = Get-StampSales (Get-RestoreStamp -Config $Config)
+    if ($base) {
+        $grew = @(Get-NewSaleTables -Baseline $base -Current $sales)
+        if ($grew.Count -eq 0) { return @{ Diverged = $false; Fingerprint = $sales; Reason = 'no new sales since last restore' } }
+        return @{ Diverged = $true; Fingerprint = $sales; Reason = ('new ' + ($grew -join ', ') + ' rows since last restore') }
     }
-    # No stamp: only safe if local already equals the published copy.
-    if ($Latest -and $Latest.fingerprint -eq $fp) { return @{ Diverged = $false; Fingerprint = $fp; Reason = 'matches published copy' } }
-    return @{ Diverged = $true; Fingerprint = $fp; Reason = 'no restore stamp and local data differs from the published copy' }
+    # No stamp: we cannot tell this laptop's sales from the seller's, so only an exact match is safe.
+    if ($Latest -and $Latest.fingerprint -and (Get-SaleFingerprint -FromFingerprint ([string]$Latest.fingerprint)) -eq $sales) {
+        return @{ Diverged = $false; Fingerprint = $sales; Reason = 'matches published copy' }
+    }
+    return @{ Diverged = $true; Fingerprint = $sales; Reason = 'no restore stamp and local sales differ from the published copy' }
 }
 
 function Test-SyncPaused {
@@ -659,6 +717,16 @@ function Test-SyncPaused {
     $state = Get-SyncState -Config $Config
     $msg = "Sales were recorded on this laptop. Sync is paused so they aren't lost. Call {0}." -f $Config.ownerContact
     if (Test-Path -LiteralPath $Config.pauseFlag) {
+        # A pause from the old, broader check (v1.0.2 and earlier) with no sale behind it: lift it.
+        $d0 = Test-Divergence -Config $Config -Latest $Latest
+        if (-not $d0.Diverged) {
+            Remove-Item -LiteralPath $Config.pauseFlag -Force
+            $state.pausedFingerprint = $null
+            $state.ackFingerprint = $null
+            Save-SyncState -Config $Config -State $state
+            Write-SyncLog -Config $Config -Level WARN -Message ('Pause lifted: no sales on this laptop since the last restore (' + $d0.Reason + ').')
+            return $false
+        }
         $last = ConvertTo-SyncTime $state.pausedToastAt
         if (-not $last -or ([DateTimeOffset]$Now - $last).TotalMinutes -ge 60) {
             Show-SyncToast -Config $Config -Kind 'diverged' -Persistent -Text $msg
@@ -686,7 +754,7 @@ function Test-SyncPaused {
         ('Paused at: ' + $Now.ToString('yyyy-MM-dd HH:mm')),
         ('Reason: ' + $d.Reason + '.'),
         '',
-        'Sales or changes were made in Aronium on this (viewing) laptop. If sync carried on,',
+        'A sale (receipt or payment) was rung up in Aronium on this (viewing) laptop. If sync carried on,',
         'they would be overwritten by the main laptop''s copy.',
         '',
         'What to do:',
@@ -766,12 +834,14 @@ function Invoke-Restore {
         if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Force -ErrorAction SilentlyContinue }
     }
 
+    $restoredFp = Get-DataFingerprint -Config $Config -Database $Config.dbPath
     Save-RestoreStamp -Config $Config -Stamp ([pscustomobject]@{
             kind         = 'restore'
             sha256       = $ExpectedSha
             published_at = $(if ($Latest) { $Latest.published_at } else { $null })
             restored_at  = (Format-SyncTime $Now)
-            fingerprint  = (Get-DataFingerprint -Config $Config -Database $Config.dbPath)
+            fingerprint  = $restoredFp
+            sales        = (Get-SaleFingerprint -FromFingerprint $restoredFp)   # baseline: max Ids and counts of the sale tables
         })
     $state = Get-SyncState -Config $Config
     $state.ackFingerprint = $null; $state.pausedFingerprint = $null; $state.laterSha = $null; $state.notifiedSha = $null

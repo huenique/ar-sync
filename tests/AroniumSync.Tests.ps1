@@ -294,9 +294,60 @@ Describe 'Divergence check (<Kind> DB)' -ForEach $Cases {
         Should -Invoke Show-SyncToast -ModuleName AroniumSync -Times 1 -Exactly
     }
 
-    It 'a product edit on the reader (no new sale) is also caught' {
-        Invoke-TestSql -Database $B.dbPath -Sql "UPDATE Product SET DateUpdated = '2026-11-26 09:45:00' WHERE Id = (SELECT min(Id) FROM Product);" | Out-Null
-        Invoke-Check -Config $B -Now $Now | Should -Be 'paused'
+    It 'routine non-sale writes on the reader do NOT pause: <What>' -ForEach @(
+        @{ What = 'shift opened (StartingCash row)'; Sql = "INSERT INTO StartingCash (UserId, Amount, DateCreated) VALUES (1, 1000, '2026-11-26 09:40:00');" }
+        @{ What = 'Z report'; Sql = "INSERT INTO ZReport (Number, FromDocumentId, ToDocumentId, DateCreated) VALUES (99, 1, 1, '2026-11-26 09:41:00');" }
+        @{ What = 'product DateUpdated churn'; Sql = "UPDATE Product SET DateUpdated = '2026-11-26 09:45:00' WHERE Id = (SELECT min(Id) FROM Product);" }
+        @{ What = 'customer DateUpdated churn'; Sql = "UPDATE Customer SET DateUpdated = '2026-11-26 09:46:00' WHERE Id = (SELECT min(Id) FROM Customer);" }
+        @{ What = 'stock recount'; Sql = "UPDATE Stock SET Quantity = Quantity + 1 WHERE Id = (SELECT min(Id) FROM Stock);" }
+    ) {
+        Invoke-TestSql -Database $B.dbPath -Sql $Sql | Out-Null
+        (Test-Divergence -Config $B -Latest (Get-Latest $A)).Diverged | Should -BeFalse
+        Invoke-Check -Config $B -Now $Now | Should -Be 'restored'
+        Test-Path $B.pauseFlag | Should -BeFalse
+        Should -Invoke Show-SyncToast -ModuleName AroniumSync -Times 0 -Exactly -ParameterFilter { $Kind -eq 'diverged' }
+    }
+
+    It 'a new Document and Payment on the reader (a real sale) DOES pause, even with non-sale writes around it' {
+        Invoke-Check -Config $B -Now $Now | Should -Be 'restored'
+        Invoke-TestSql -Database $B.dbPath -Sql "INSERT INTO StartingCash (UserId, Amount, DateCreated) VALUES (1, 1000, '2026-11-26 10:01:00');" | Out-Null
+        Add-TestSale -Database $B.dbPath -When '2026-11-26 10:02:00'
+        $d = Test-Divergence -Config $B -Latest (Get-Latest $A)
+        $d.Diverged | Should -BeTrue
+        $d.Reason | Should -BeLike '*Document*'
+        Invoke-Check -Config $B -Now $Now.AddMinutes(5) | Should -Be 'paused'
+    }
+
+    It 'a Payment alone added on the reader also pauses' {
+        Invoke-Check -Config $B -Now $Now | Should -Be 'restored'
+        Invoke-TestSql -Database $B.dbPath -Sql "INSERT INTO Payment (DocumentId, PaymentTypeId, Amount, Date) VALUES ((SELECT max(Id) FROM Document), 1, 5, '2026-11-26');" | Out-Null
+        Invoke-Check -Config $B -Now $Now.AddMinutes(5) | Should -Be 'paused'
+    }
+
+    It 'lifts a pause left by the old, broader check when the reader has no new sales (upgrade from v1.0.2)' {
+        Invoke-Check -Config $B -Now $Now | Should -Be 'restored'
+        # As v1.0.2 left it: a stamp without sale baselines, a pause flag, and only a shift opened.
+        $stamp = Get-RestoreStamp -Config $B
+        Save-RestoreStamp -Config $B -Stamp ([pscustomobject]@{ kind = 'restore'; sha256 = $stamp.sha256; published_at = $stamp.published_at; restored_at = $stamp.restored_at; fingerprint = $stamp.fingerprint })
+        Invoke-TestSql -Database $B.dbPath -Sql "INSERT INTO StartingCash (UserId, Amount, DateCreated) VALUES (1, 1000, '2026-11-27 08:00:00');" | Out-Null
+        Set-Content -LiteralPath $B.pauseFlag -Value 'paused by v1.0.2'
+        Add-TestSale -Database $A.dbPath
+        Invoke-Publish -Config $A -Now $Now.AddMinutes(10) -HostName 'LAPTOP-A' | Should -Be 'published'
+        Invoke-Check -Config $B -Now $Now.AddMinutes(15) | Should -Be 'restored'
+        Test-Path $B.pauseFlag | Should -BeFalse
+        Get-DocCount $B.dbPath | Should -Be (Get-DocCount $A.dbPath)
+    }
+
+    It 'keeps a pause when the reader really has its own sales (old stamp too)' {
+        Invoke-Check -Config $B -Now $Now | Should -Be 'restored'
+        $stamp = Get-RestoreStamp -Config $B
+        Save-RestoreStamp -Config $B -Stamp ([pscustomobject]@{ kind = 'restore'; sha256 = $stamp.sha256; published_at = $stamp.published_at; restored_at = $stamp.restored_at; fingerprint = $stamp.fingerprint })
+        Add-TestSale -Database $B.dbPath -When '2026-11-27 08:05:00'
+        Set-Content -LiteralPath $B.pauseFlag -Value 'paused by v1.0.2'
+        $shaBefore = Get-FileSha256 $B.dbPath
+        Invoke-Check -Config $B -Now $Now.AddMinutes(15) | Should -Be 'paused'
+        Test-Path $B.pauseFlag | Should -BeTrue
+        Get-FileSha256 $B.dbPath | Should -Be $shaBefore
     }
 
     It 'clearing the flag lets the next run restore, keeping the local sales in a .bak' {

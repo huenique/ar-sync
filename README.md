@@ -45,7 +45,7 @@ Everything lives in `%LOCALAPPDATA%\AroniumSync`. The log is `sync.log` in that 
 |---|---|---|
 | **New data from the main laptop (as of 14:30). Restart Aronium to see it.** | Viewing | Click **Update now**. Aronium closes, loads the new data and opens again. If you're busy, click **Later** and it will ask again when the next copy arrives. If Aronium is already closed, the update happens on its own with no notification. |
 | **Please close Aronium, then click Update now again.** | Viewing | Aronium didn't close by itself, maybe because a window or dialog is open. Finish what you're doing, close Aronium, then try again. Sync never forces Aronium closed. |
-| **Sales were recorded on this laptop. Sync is paused so they aren't lost. Call [owner].** | Viewing | Someone used the viewing laptop to sell or change something. Sync has stopped. See [Clearing a sync pause](#clearing-a-sync-pause). |
+| **Sales were recorded on this laptop. Sync is paused so they aren't lost. Call [owner].** | Viewing | Someone rang up a sale (a receipt or payment) on the viewing laptop. Sync has stopped. Opening a shift, Z reports or product edits on the viewing laptop do not pause sync; they are replaced by the next copy. See [Clearing a sync pause](#clearing-a-sync-pause). |
 | **Main laptop last synced at 10:15. If it's down, use Take over.** | Viewing | The selling laptop hasn't saved a copy for over an hour during shop hours. The hour counts from opening time, so a selling laptop that is switched on a little late doesn't trigger it. If the last copy is from an earlier day, the day is shown too (for example "Wed 20:00"). Check it's on, awake and connected to the internet. If it's broken, see [Take over](#take-over-the-selling-laptop-is-down). |
 | **Backup failed at 14:30: (reason)** | Selling | The copy didn't save. Common causes are OneDrive not running or signed out, a full disk, or a damaged database. It retries every 15 minutes. If it keeps failing, call the owner. |
 | **This laptop is no longer the selling laptop. Do not sell on it.** | Old selling laptop | The other laptop has taken over. Stop selling here. Reinstall this laptop with `-Role reader` once it's sorted out. |
@@ -94,7 +94,7 @@ Do it in this order:
 
 ## Clearing a sync pause
 
-A pause means sales or changes were made on the viewing laptop. If sync carried on, the main laptop's copy would overwrite them.
+A pause means a sale (receipt or payment) was rung up on the viewing laptop. If sync carried on, the main laptop's copy would overwrite them.
 
 1. Open Aronium on the viewing laptop and note the sales made there: time, items, amounts.
 2. Enter them on the selling laptop, or decide they're not needed.
