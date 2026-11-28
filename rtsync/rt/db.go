@@ -244,3 +244,18 @@ func (d *DB) commit() error {
 }
 
 func (d *DB) rollback() { d.exec("ROLLBACK") }
+
+// GetMeta and SetMeta expose the sync's own key/value store (sidecar state
+// that must live in the same file, e.g. how far the peer has acknowledged).
+func (d *DB) GetMeta(k string) (string, error) {
+	v, _, err := d.getMeta(k)
+	return v, err
+}
+
+func (d *DB) SetMeta(k, v string) error { return d.setMeta(k, v) }
+
+// SeedTag is the tag both laptops must share.
+func (d *DB) SeedTag() string {
+	v, _, _ := d.getMeta("seed_tag")
+	return v
+}

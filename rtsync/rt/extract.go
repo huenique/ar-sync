@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // SchemaTag fingerprints the synced tables' columns. Both laptops must agree
@@ -25,6 +26,13 @@ func (d *DB) SchemaTag() string {
 // most `limit` log rows. Rows deleted since they were logged are skipped (the
 // delete itself follows).
 func (d *DB) Extract(since int64, limit int) (*Batch, error) {
+	return d.ExtractSettled(since, limit, 0)
+}
+
+// ExtractSettled is Extract that stops at the first log row written less than
+// `settleMs` ago, so a receipt Aronium is still finishing (it updates the
+// total and paid status right after inserting) travels in one piece.
+func (d *DB) ExtractSettled(since int64, limit int, settleMs int64) (*Batch, error) {
 	node, err := d.Node()
 	if err != nil {
 		return nil, err
@@ -41,7 +49,11 @@ func (d *DB) Extract(since int64, limit int) (*Batch, error) {
 		return nil, err
 	}
 	b := &Batch{Origin: node, SeedTag: tag, Schema: d.SchemaTag(), From: since + 1, To: since}
-	rows, err := d.query("SELECT seq,tbl,op,rid,keyv,cols,delta,hlc FROM _rt_log WHERE seq>? AND hlc IS NOT NULL ORDER BY seq LIMIT ?", since, limit)
+	cutoff := int64(1) << 62
+	if settleMs > 0 {
+		cutoff = time.Now().UnixMilli() - settleMs
+	}
+	rows, err := d.query("SELECT seq,tbl,op,rid,keyv,cols,delta,hlc,wall FROM _rt_log WHERE seq>? AND hlc IS NOT NULL ORDER BY seq LIMIT ?", since, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -52,11 +64,12 @@ func (d *DB) Extract(since int64, limit int) (*Batch, error) {
 		keyv     sql.NullString
 		cols     sql.NullString
 		delta    sql.NullFloat64
+		wall     int64
 	}
 	var lrs []lr
 	for rows.Next() {
 		var r lr
-		if err := rows.Scan(&r.seq, &r.tbl, &r.op, &r.rid, &r.keyv, &r.cols, &r.delta, &r.hlc); err != nil {
+		if err := rows.Scan(&r.seq, &r.tbl, &r.op, &r.rid, &r.keyv, &r.cols, &r.delta, &r.hlc, &r.wall); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -64,6 +77,9 @@ func (d *DB) Extract(since int64, limit int) (*Batch, error) {
 	}
 	rows.Close()
 	for _, r := range lrs {
+		if r.wall > cutoff {
+			break
+		}
 		b.To = r.seq
 		if r.hlc > b.MaxHLC {
 			b.MaxHLC = r.hlc

@@ -257,3 +257,27 @@ func (d *DB) catchUp() (int, error) {
 	}
 	return n, nil
 }
+
+// TriggersOn reports whether the triggers are installed (per the engine's own record).
+func (d *DB) TriggersOn() bool {
+	v, _, _ := d.getMeta("triggers")
+	return v == "on"
+}
+
+// Prune deletes this laptop's log rows the peer has applied (seq <= acked)
+// and that are older than keepMs. Returns rows removed.
+func (d *DB) Prune(acked int64, keepMs int64) (int64, error) {
+	r, err := d.exec("DELETE FROM _rt_log WHERE seq <= ? AND hlc IS NOT NULL AND wall < ?", acked, time.Now().UnixMilli()-keepMs)
+	if err != nil {
+		return 0, err
+	}
+	return r.RowsAffected()
+}
+
+// MigrationCount is Aronium's applied migration count; it changes when an
+// Aronium update migrates the database.
+func (d *DB) MigrationCount() (int64, error) {
+	var n int64
+	err := d.one("SELECT count(*) FROM Migration").Scan(&n)
+	return n, err
+}
