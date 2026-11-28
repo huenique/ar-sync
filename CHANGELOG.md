@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.0.3
+
+- **Fix:** the viewing laptop no longer pauses sync when nobody sold anything on it.
+  - Before this, opening a shift (starting cash), a Z report, or Aronium updating a product or customer while it was open counted as "sales made here". The pause showed "Sales were recorded on this laptop" for days.
+  - Now only new receipts, receipt lines or payments since the last restore pause sync. The restore stamp records those counts and highest Ids as its baseline.
+- A pause left by an older version with no sale behind it is lifted automatically on the next check. A pause with a real sale behind it stays.
+
 ## v1.0.2
 
 - **Fix:** the auto-updater failed and rolled back on laptops whose Windows user folder has a space, such as "M.O FLORES CONS".
